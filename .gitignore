@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+*.uf2
+*.bin
+*.elf
+.DS_Store
+Thumbs.db
