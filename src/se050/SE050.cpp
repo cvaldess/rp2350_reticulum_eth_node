@@ -1196,15 +1196,37 @@ void SE050::dryRunRotation()
 
 bool SE050::rotatePlatformKeys()
 {
-    // Open the channel with the current keys if it is not already up, so the command works
-    // whatever the loop left behind. For a not-yet-rotated chip this opens with the factory keys.
-    if (!scp.open && (!open() || !openSecureChannel())) {
-        LOG_ERROR("SE050: cannot open a channel with the current keys, not rotating");
-        return false;
-    }
     if (usingRotatedKeys) {
         LOG_WARN("SE050: this chip already runs rotated keys, nothing to do");
         return true;
+    }
+
+    // PUT KEY targets the security domain that owns the Platform SCP keys, not the IoT applet
+    // (with the applet selected it returned 6a80; with nothing selected INITIALIZE UPDATE
+    // returned 6a88). NXP's middleware selects the SSD for rotation (sm_const.h SSD_NAME =
+    // D276000085304A434F9003, "Rotate keys ... Select SSD" in sm_connect.c). So: interface
+    // reset, SELECT that SSD, then open Platform SCP there and send PUT KEY.
+    scp.open = sessionActive = false;
+    usingRotatedKeys = false;
+    if (!reset()) {
+        LOG_ERROR("SE050: interface reset failed, not rotating");
+        return false;
+    }
+    {
+        static const uint8_t SEL_SSD[] = {0x00, 0xA4, 0x04, 0x00, 0x0B, 0xD2, 0x76, 0x00,
+                                          0x00, 0x85, 0x30, 0x4A, 0x43, 0x4F, 0x90, 0x03};
+        uint8_t r[64];
+        int n = transceive(SEL_SSD, sizeof(SEL_SSD), r, sizeof(r));
+        uint16_t sw = statusWord(r, n);
+        if (sw != 0x9000) {
+            LOG_ERROR("SE050: SELECT SSD returned SW=%04x, not rotating", sw);
+            return false;
+        }
+        LOG_INFO("SE050: SSD selected for rotation");
+    }
+    if (!openSecureChannel()) {
+        LOG_ERROR("SE050: cannot open a Platform SCP channel on the SSD, not rotating");
+        return false;
     }
 
     uint8_t data[128], expected[16];

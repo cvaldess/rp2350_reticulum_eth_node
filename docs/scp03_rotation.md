@@ -114,9 +114,27 @@ Cross-checked on bench 1 (non-destructive, chip untouched): `D` derived
 `ENC c2c3e3f9… MAC ffc75a4d… DEK 143a68fc…`; the full 70-byte PUT KEY field and the 10-byte
 expected response are **byte-identical** to `scp03_rotate.py plan` for those keys.
 
-## What still needs a real send (on a spare SE050 first)
+## PUT KEY goes to the SSD, not the IoT applet
 
-The dry run proves the bytes; only a real PUT KEY proves the chip accepts them. Do it on a
-virgin spare SE050, run the full cycle (`R` `!` → SW 9000 → KCVs match → channel reopens →
-identity signs), twice clean, before touching bench 1. The `plan`/`verify`/`selftest`/`D` paths
-never write to the chip.
+The first real send, with the IoT applet selected, returned `6a80` (bad data field); with
+nothing selected, INITIALIZE UPDATE returned `6a88` (keyset not found). PUT KEY targets the
+security domain that owns the Platform SCP keys. NXP's middleware selects the SSD for rotation
+(`sm_const.h` `SSD_NAME = D2 76 00 00 85 30 4A 43 4F 90 03`; "Rotate keys … Select SSD" in
+`sm_connect.c`). So `rotatePlatformKeys()` does: interface reset, `SELECT` that SSD
+(`00 A4 04 00 0B D2 76 00 00 85 30 4A 43 4F 90 03`), open Platform SCP there, PUT KEY. Normal
+operation still selects the IoT applet; only the rotation touches the SSD.
+
+## Done on bench 1 (2026-09-16)
+
+Rotated for real. `SSD selected → PUT KEY accepted → chip echoed the expected KVN+KCVs → channel
+reopened with the per-device keys → identity 0462BB05… intact`. Cold reboot: the factory keys are
+rejected, the derived keys open the channel, the application identity and destination
+(`cae43b19…`) are unchanged, and `rnprobe` from the Pine64 is 3/3. Identity objects (X25519/
+Ed25519) were untouched — rotation only replaces the channel keys.
+
+Bench 1's `pico2_w5500_e22` env now carries `-D SE050_ROTATED` (derivation + fallback, no send)
+so its normal firmware opens the rotated chip. The send path stays behind `-D SE050_ALLOW_
+ROTATION`, off by default.
+
+The keys are derived from the bench master in `se050_port.h`; a real deployment moves that to OTP
+(the vault flash task). The `plan`/`verify`/`selftest`/`D` paths never write to the chip.
