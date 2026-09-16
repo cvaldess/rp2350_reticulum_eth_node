@@ -307,6 +307,10 @@ static void handleConsole()
             if (se050)
                 Serial.printf("[se050] re-probe %s\n", se050->probe() ? "OK" : "FAILED");
             break;
+        case 'k': // SCP03 crypto cross-check for tools/scp03_rotate.py (no chip writes)
+            if (se050)
+                se050->benchScp03Kat();
+            break;
         // Fault injection for the vault's recovery path (bench only). Follow any of them
         // with `a`: the announce signs in the chip and has to come out signed anyway.
         case 'x': // the chip loses everything: SCP03 state, session, T=1 sequence

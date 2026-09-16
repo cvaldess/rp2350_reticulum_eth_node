@@ -404,6 +404,10 @@ bool SE050::openSecureChannel()
     if (!initializeUpdate(hostChallenge, cardChallenge, cardCryptogram))
         return false;
 
+    memcpy(lastHostChallenge, hostChallenge, 8);
+    memcpy(lastCardChallenge, cardChallenge, 8);
+    memcpy(lastCardCryptogram, cardCryptogram, 8);
+
     uint8_t context[16];
     memcpy(context, hostChallenge, 8);
     memcpy(&context[8], cardChallenge, 8);
@@ -1036,6 +1040,39 @@ bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint
         scp.open = sessionActive = false;
     }
     return false;
+}
+
+static void benchHex(const char *label, const uint8_t *b, size_t n)
+{
+    char hex[2 * 32 + 1];
+    for (size_t i = 0; i < n && i < 32; i++)
+        snprintf(&hex[i * 2], 3, "%02x", b[i]);
+    Serial.printf("  %s = %s\n", label, hex);
+}
+
+void SE050::benchScp03Kat()
+{
+    // The fixed KAT vector from tools/scp03_rotate.py selftest. If these three lines match
+    // the tool's, SE050::cmac() and SE050::kdf() are byte-identical to the reference, which
+    // is what the whole PUT KEY assembly leans on.
+    static const uint8_t katKey[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                       0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
+    static const uint8_t katCtx[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                                       0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+    Serial.println("[se050] SCP03 KAT (compare with tools/scp03_rotate.py selftest):");
+    uint8_t out[16];
+    cmac(katKey, katCtx, sizeof(katCtx), out);
+    benchHex("cmac(kat_key, kat_ctx)          ", out, 16);
+    kdf(katKey, 0x04, 128, katCtx, out);
+    benchHex("kdf(kat_key, 0x04, 128, kat_ctx)", out, 16);
+    kdf(katKey, 0x06, 128, katCtx, out);
+    benchHex("kdf(kat_key, 0x06, 128, kat_ctx)", out, 16);
+
+    // The last session's public challenges + the cryptogram the chip sent, for `verify`.
+    Serial.println("[se050] last SCP03 session (for scp03_rotate.py verify):");
+    benchHex("hostChallenge ", lastHostChallenge, 8);
+    benchHex("cardChallenge ", lastCardChallenge, 8);
+    benchHex("cardCryptogram", lastCardCryptogram, 8);
 }
 
 void SE050::faultInject(char what)

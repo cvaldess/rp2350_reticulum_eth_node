@@ -136,6 +136,12 @@ class SE050
     // (ENA low/high) is injected from outside, it needs no help from the driver.
     void faultInject(char what);
 
+    // Bench-only: cross-check for the SCP03 rotation planner (tools/scp03_rotate.py). Runs
+    // cmac() and kdf() on the fixed KAT vector that tool prints, and dumps the last session's
+    // host/card challenge and card cryptogram so the tool's `verify` can reproduce them. No
+    // chip writes; nothing here rotates anything.
+    void benchScp03Kat();
+
   private:
     // Writes one block and reads the answer. Returns the total framed length
     // (3 + LEN + 2), or 0 if nothing valid came back.
@@ -237,6 +243,9 @@ class SE050
     uint32_t activeKeyObj = 0;
     bool signingReady = false;
     PowerCycleFn powerCycle = nullptr;
+    uint8_t lastHostChallenge[8] = {};
+    uint8_t lastCardChallenge[8] = {};
+    uint8_t lastCardCryptogram[8] = {};
 };
 
 // The instance the boot probe left behind, or null if this board has no SE050 or
