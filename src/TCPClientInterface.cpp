@@ -61,8 +61,9 @@ bool TCPClientInterface::tryConnect()
     _escape = false;
     _rx.clear();
     _online = true;
-    if (_wasConnected)
+    if (_everConnected)
         _reconnects++;
+    _everConnected = true;
     _wasConnected = true;
     INFOF("%s: connected to %u.%u.%u.%u:%u", toString().c_str(), _host[0], _host[1], _host[2], _host[3], _port);
     return true;

@@ -45,7 +45,8 @@ class TCPClientInterface : public RNS::InterfaceImpl
     uint16_t _port;
     uint32_t _lastAttempt = 0;
     uint32_t _reconnects = 0;
-    bool _wasConnected = false;
+    bool _wasConnected = false;  // socket was up on the previous loop pass
+    bool _everConnected = false; // at least one successful connect since boot
 
     // HDLC receive state
     bool _inFrame = false;
