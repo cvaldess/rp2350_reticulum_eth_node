@@ -272,8 +272,10 @@ class SE050
     uint8_t curEnc[16] = {};
     uint8_t curMac[16] = {};
     uint8_t curDek[16] = {};
-#ifdef SE050_ALLOW_ROTATION
+#ifdef SE050_ROTATED
     void deriveRotatedKeys(uint8_t enc[16], uint8_t mac[16], uint8_t dek[16]);
+#endif
+#ifdef SE050_ALLOW_ROTATION
     // Assembles the PUT KEY data field (NXP createKeyData layout) into data (>=128 bytes) and
     // the expected success response (KVN + 3 KCVs) into expected[10]. Returns the data length.
     int buildPutKeyData(uint8_t *data, uint8_t *expected);

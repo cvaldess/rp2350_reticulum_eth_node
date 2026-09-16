@@ -10,7 +10,7 @@
 #include <Arduino.h>
 #include <Curve25519.h>
 #include <Ed25519.h>
-#ifdef SE050_ALLOW_ROTATION
+#ifdef SE050_ROTATED
 #include <SHA256.h>
 #endif
 #include <string.h>
@@ -403,7 +403,7 @@ bool SE050::openSecureChannel()
     usingRotatedKeys = false;
     if (tryOpenChannel())
         return true;
-#ifdef SE050_ALLOW_ROTATION
+#ifdef SE050_ROTATED
     LOG_INFO("SE050: factory keys did not open the channel, trying the per-device rotated keys");
     deriveRotatedKeys(curEnc, curMac, curDek);
     usingRotatedKeys = true;
@@ -1110,14 +1110,13 @@ void SE050::benchScp03Kat()
     benchHex("cardCryptogram", lastCardCryptogram, 8);
 }
 
-#ifdef SE050_ALLOW_ROTATION
-// --- Platform SCP03 key rotation (bench only, -D SE050_ALLOW_ROTATION) ------------
+#ifdef SE050_ROTATED
+// --- Per-device Platform SCP03 keys ----------------------------------------------
 //
-// Replaces NXP's public factory keys with per-device keys so only this host can open
-// the channel of this chip. The framing matches NXP's own demo byte for byte
-// (se05x_RotatePlatformSCP03Keys/se05x_TP_PlatformSCP03keys.c, createKeyData); it is
-// cross-checked against tools/scp03_rotate.py, and dryRunRotation() prints the same
-// bytes without sending so the two can be diffed on-device before anything is sent.
+// Derivation and use of the rotated keys. Compiled on any board that talks to a rotated
+// chip; the one-way send that puts them there is separate, under SE050_ALLOW_ROTATION.
+// The framing matches NXP's own demo byte for byte (se05x_RotatePlatformSCP03Keys/
+// se05x_TP_PlatformSCP03keys.c, createKeyData), cross-checked against tools/scp03_rotate.py.
 
 static void deriveOne(const uint8_t *master, size_t mlen, const char *label, uint8_t out[16])
 {
@@ -1137,6 +1136,10 @@ void SE050::deriveRotatedKeys(uint8_t enc[16], uint8_t mac[16], uint8_t dek[16])
     deriveOne(master, sizeof(master), "SCP03-MAC", mac);
     deriveOne(master, sizeof(master), "SCP03-DEK", dek);
 }
+#endif // SE050_ROTATED
+
+#ifdef SE050_ALLOW_ROTATION
+// --- The one-way send (PUT KEY). Bench only, -D SE050_ALLOW_ROTATION. -------------
 
 int SE050::buildPutKeyData(uint8_t *data, uint8_t *expected)
 {
@@ -1193,8 +1196,10 @@ void SE050::dryRunRotation()
 
 bool SE050::rotatePlatformKeys()
 {
-    if (!scp.open) {
-        LOG_ERROR("SE050: rotation needs an open channel with the current keys");
+    // Open the channel with the current keys if it is not already up, so the command works
+    // whatever the loop left behind. For a not-yet-rotated chip this opens with the factory keys.
+    if (!scp.open && (!open() || !openSecureChannel())) {
+        LOG_ERROR("SE050: cannot open a channel with the current keys, not rotating");
         return false;
     }
     if (usingRotatedKeys) {

@@ -16,7 +16,15 @@
 #endif
 #define ARCH_RP2040 1
 
-#ifdef SE050_ALLOW_ROTATION
+// Two flags. SE050_ROTATED: the firmware knows the per-device keys and opens a rotated chip
+// (derivation + the factory->derived fallback), safe to ship on a rotated board. SE050_ALLOW_
+// ROTATION: also compiles the one-way send path (PUT KEY, the D/R/! console). Allowing the send
+// implies knowing the keys.
+#if defined(SE050_ALLOW_ROTATION) && !defined(SE050_ROTATED)
+#define SE050_ROTATED
+#endif
+
+#ifdef SE050_ROTATED
 // Master the per-device Platform SCP03 keys are derived from: key_i = SHA256(master || label)[:16].
 // BENCH PLACEHOLDER, committed only so a rotation is reproducible on a sacrificial chip. A real
 // deployment derives this from OTP / a provisioning secret and never keeps it in source; see
