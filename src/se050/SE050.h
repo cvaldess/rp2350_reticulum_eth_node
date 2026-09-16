@@ -142,6 +142,21 @@ class SE050
     // chip writes; nothing here rotates anything.
     void benchScp03Kat();
 
+#ifdef SE050_ALLOW_ROTATION
+    // Builds the PUT KEY command for the per-device keys and prints it (data field + the
+    // response the chip would echo), WITHOUT sending. Compare against tools/scp03_rotate.py
+    // plan for the same derived keys. Safe on any chip.
+    void dryRunRotation();
+
+    // Irreversible, bench only. Replaces the factory Platform SCP03 keys with per-device keys
+    // derived from SE050_ROTATION_MASTER (PUT KEY, INS 0xD8). Needs an open channel with the
+    // current keys; on success verifies the KCVs the chip echoes, adopts the new keys and
+    // reopens the channel to confirm before returning true. A malformed send is rejected by
+    // the chip (no-op); a good send is one-way. Run it on a spare SE050 first, never on a chip
+    // that matters until the whole cycle is proven. See docs/scp03_rotation.md.
+    bool rotatePlatformKeys();
+#endif
+
   private:
     // Writes one block and reads the answer. Returns the total framed length
     // (3 + LEN + 2), or 0 if nothing valid came back.
@@ -156,6 +171,10 @@ class SE050
     bool reentered(const char *what);
 
     bool selectApplet();
+
+    // One attempt at the SCP03 channel with whichever key set usingRotatedKeys selects.
+    // openSecureChannel() calls it, falling back from the factory keys to the rotated ones.
+    bool tryOpenChannel();
 
     // Session or channel gone: applet select, SCP03 and the UserID session again.
     bool recover(const char *what);
@@ -246,6 +265,19 @@ class SE050
     uint8_t lastHostChallenge[8] = {};
     uint8_t lastCardChallenge[8] = {};
     uint8_t lastCardCryptogram[8] = {};
+
+    // Which Platform SCP03 key set is in use. false = NXP factory keys (SCP_KEY_ENC/MAC/DEK);
+    // true = the per-device keys derived from the master, held in curEnc/curMac/curDek.
+    bool usingRotatedKeys = false;
+    uint8_t curEnc[16] = {};
+    uint8_t curMac[16] = {};
+    uint8_t curDek[16] = {};
+#ifdef SE050_ALLOW_ROTATION
+    void deriveRotatedKeys(uint8_t enc[16], uint8_t mac[16], uint8_t dek[16]);
+    // Assembles the PUT KEY data field (NXP createKeyData layout) into data (>=128 bytes) and
+    // the expected success response (KVN + 3 KCVs) into expected[10]. Returns the data length.
+    int buildPutKeyData(uint8_t *data, uint8_t *expected);
+#endif
 };
 
 // The instance the boot probe left behind, or null if this board has no SE050 or

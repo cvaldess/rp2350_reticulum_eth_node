@@ -16,6 +16,20 @@
 #endif
 #define ARCH_RP2040 1
 
+#ifdef SE050_ALLOW_ROTATION
+// Master the per-device Platform SCP03 keys are derived from: key_i = SHA256(master || label)[:16].
+// BENCH PLACEHOLDER, committed only so a rotation is reproducible on a sacrificial chip. A real
+// deployment derives this from OTP / a provisioning secret and never keeps it in source; see
+// docs/scp03_rotation.md and the vault task "Proteger la flash del RP2350". "rp2350-reticulum-bench-master".
+#ifndef SE050_ROTATION_MASTER
+#define SE050_ROTATION_MASTER                                                                                      \
+    {                                                                                                              \
+        0x72, 0x70, 0x32, 0x33, 0x35, 0x30, 0x2d, 0x72, 0x65, 0x74, 0x69, 0x63, 0x75, 0x6c, 0x75, 0x6d, 0x2d,     \
+            0x62, 0x65, 0x6e, 0x63, 0x68, 0x2d, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x2d, 0x76, 0x31              \
+    }
+#endif
+#endif
+
 inline void se050Log(const char *level, const char *fmt, ...)
 {
     char line[192];

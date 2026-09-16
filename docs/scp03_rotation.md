@@ -87,5 +87,36 @@ source is not redistributed in this repo.
    the chip returns with the computed ones, and immediately open a fresh channel with the new
    keys. Only if that succeeds is the rotation good; the old keys are already gone.
 
-The `plan`/`verify`/`selftest` tool and the `k` command never write to the chip. The send step
-is deliberately not implemented in either.
+## The send path (firmware, gated)
+
+Built only with `-D SE050_ALLOW_ROTATION`; the normal firmware has none of it. Per-device keys
+are derived on-device: `key_i = SHA256(SE050_ROTATION_MASTER ‖ label_i)[:16]` (labels
+`SCP03-ENC/MAC/DEK`). The master lives in `se050_port.h` as a **bench placeholder**; a real
+build derives it from OTP (see the flash task) so it is per-device and not in source.
+
+- `SE050::deriveRotatedKeys()` — the derivation.
+- `SE050::buildPutKeyData()` — the 70-byte field, byte-identical to the demo and to
+  `scp03_rotate.py plan` (verified on bench 1, see below).
+- `SE050::dryRunRotation()` (console `D`) — prints the derived keys + PUT KEY field + expected
+  response. **Sends nothing.**
+- `SE050::rotatePlatformKeys()` (console `R` then `!` within 5 s) — the irreversible send:
+  PUT KEY, check `SW=9000`, compare the echoed KVN+KCVs against the computed ones, then adopt
+  the new keys and reopen the channel to confirm before returning true. A rejected send is a
+  no-op; a good send is one-way.
+- `openSecureChannel()` now tries the factory keys and, on a cryptogram mismatch, the derived
+  keys, so a rotated chip reopens on every boot with no persisted flag.
+
+Build the rotation firmware (for the spare chip) without committing the flag:
+
+    PLATFORMIO_BUILD_FLAGS="-DSE050_ALLOW_ROTATION" pio run -e pico2_w5500_e22 -t upload --upload-port COM64
+
+Cross-checked on bench 1 (non-destructive, chip untouched): `D` derived
+`ENC c2c3e3f9… MAC ffc75a4d… DEK 143a68fc…`; the full 70-byte PUT KEY field and the 10-byte
+expected response are **byte-identical** to `scp03_rotate.py plan` for those keys.
+
+## What still needs a real send (on a spare SE050 first)
+
+The dry run proves the bytes; only a real PUT KEY proves the chip accepts them. Do it on a
+virgin spare SE050, run the full cycle (`R` `!` → SW 9000 → KCVs match → channel reopens →
+identity signs), twice clean, before touching bench 1. The `plan`/`verify`/`selftest`/`D` paths
+never write to the chip.

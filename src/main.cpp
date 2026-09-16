@@ -278,6 +278,9 @@ static bool reticulumSetup()
 // USB console: the only thing USB carries besides flashing.
 static void handleConsole()
 {
+#ifdef SE050_ALLOW_ROTATION
+    static uint32_t rotateArmed = 0; // millis() when 'R' armed the rotation; '!' confirms
+#endif
     while (Serial.available()) {
         switch (Serial.read()) {
         case 'r':
@@ -311,6 +314,25 @@ static void handleConsole()
             if (se050)
                 se050->benchScp03Kat();
             break;
+#ifdef SE050_ALLOW_ROTATION
+        case 'D': // dry run: print the PUT KEY the rotation would send, without sending
+            if (se050)
+                se050->dryRunRotation();
+            break;
+        case 'R': // arm the (irreversible) Platform SCP03 rotation
+            rotateArmed = millis();
+            Serial.println("[se050] ROTATION ARMED (irreversible, spare SE050 only). Send '!' within 5 s.");
+            break;
+        case '!':
+            if (se050 && rotateArmed != 0 && millis() - rotateArmed < 5000) {
+                rotateArmed = 0;
+                Serial.println("[se050] rotating Platform SCP03 keys...");
+                Serial.printf("[se050] rotation %s\n", se050->rotatePlatformKeys() ? "OK" : "FAILED");
+            } else {
+                Serial.println("[se050] '!' ignored (not armed / timed out); send 'R' first");
+            }
+            break;
+#endif
         // Fault injection for the vault's recovery path (bench only). Follow any of them
         // with `a`: the announce signs in the chip and has to come out signed anyway.
         case 'x': // the chip loses everything: SCP03 state, session, T=1 sequence

@@ -10,6 +10,9 @@
 #include <Arduino.h>
 #include <Curve25519.h>
 #include <Ed25519.h>
+#ifdef SE050_ALLOW_ROTATION
+#include <SHA256.h>
+#endif
 #include <string.h>
 
 SE050 *se050 = nullptr;
@@ -260,6 +263,10 @@ static const uint8_t SCP_KEY_ENC[16] = {0xD2, 0xDB, 0x63, 0xE7, 0xA0, 0xA5, 0xAE
                                         0x2A, 0x64, 0x60, 0xC4, 0xDF, 0xDC, 0xAF, 0x64};
 static const uint8_t SCP_KEY_MAC[16] = {0x73, 0x8D, 0x5B, 0x79, 0x8E, 0xD2, 0x41, 0xB0,
                                         0xB2, 0x47, 0x68, 0x51, 0x4B, 0xFB, 0xA9, 0x5B};
+// Factory DEK for the same OEF (AN12436). The running channel never needed it - only ENC/MAC
+// derive the session keys - but PUT KEY encrypts the new key components under the current DEK.
+static const uint8_t SCP_KEY_DEK[16] = {0x67, 0x02, 0xDA, 0xC3, 0x09, 0x42, 0xB2, 0xC8,
+                                        0x5E, 0x7F, 0x47, 0xB4, 0x2C, 0xED, 0x4E, 0x7F};
 static constexpr uint8_t SCP03_KEYVER = 0x0B;
 
 // AES-CMAC (RFC 4493). The bundled Crypto library only exposes OMAC in its EAX
@@ -328,9 +335,12 @@ void SE050::kdf(const uint8_t key[16], uint8_t constant, uint16_t bits, const ui
 
 void SE050::sessionKeys(const uint8_t context[16])
 {
-    kdf(SCP_KEY_ENC, 0x04, 128, context, scp.senc);
-    kdf(SCP_KEY_MAC, 0x06, 128, context, scp.smac);
-    kdf(SCP_KEY_MAC, 0x07, 128, context, scp.srmac);
+    // Factory keys until a rotation switched the chip (and this driver) to per-device keys.
+    const uint8_t *enc = usingRotatedKeys ? curEnc : SCP_KEY_ENC;
+    const uint8_t *mac = usingRotatedKeys ? curMac : SCP_KEY_MAC;
+    kdf(enc, 0x04, 128, context, scp.senc);
+    kdf(mac, 0x06, 128, context, scp.smac);
+    kdf(mac, 0x07, 128, context, scp.srmac);
 }
 
 // Cryptograms are the first 8 bytes of a 64-bit derivation off S-MAC.
@@ -386,6 +396,28 @@ bool SE050::initializeUpdate(const uint8_t hostChallenge[8], uint8_t cardChallen
 
 bool SE050::openSecureChannel()
 {
+    // Virgin chips still hold the factory keys; a rotated one only answers to the per-device
+    // keys. Try factory first (the common case and the pre-rotation state), and only when the
+    // chip rejects them derive the rotated keys and try those, so a rotated chip reopens on
+    // every boot without any persisted flag.
+    usingRotatedKeys = false;
+    if (tryOpenChannel())
+        return true;
+#ifdef SE050_ALLOW_ROTATION
+    LOG_INFO("SE050: factory keys did not open the channel, trying the per-device rotated keys");
+    deriveRotatedKeys(curEnc, curMac, curDek);
+    usingRotatedKeys = true;
+    if (tryOpenChannel()) {
+        LOG_INFO("SE050: channel open with the rotated keys");
+        return true;
+    }
+    usingRotatedKeys = false;
+#endif
+    return false;
+}
+
+bool SE050::tryOpenChannel()
+{
     memset(&scp, 0, sizeof(scp));
     // A new channel means the UserID session nested in the old one is gone too;
     // the chip was reset to get here. Leaving the flag set made a re-probe try
@@ -418,7 +450,9 @@ bool SE050::openSecureChannel()
     uint8_t expected[8];
     cryptogram(0x00, context, expected);
     if (memcmp(expected, cardCryptogram, 8) != 0) {
-        LOG_ERROR("SE050: card cryptogram mismatch - keys rotated, or a different KDF");
+        // Wrong key set for this chip (the usual reason a rotated chip rejects the factory
+        // keys), or a broken KDF. openSecureChannel() may retry with the other key set.
+        LOG_INFO("SE050: card cryptogram mismatch with the %s keys", usingRotatedKeys ? "rotated" : "factory");
         return false;
     }
 
@@ -1044,8 +1078,9 @@ bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint
 
 static void benchHex(const char *label, const uint8_t *b, size_t n)
 {
-    char hex[2 * 32 + 1];
-    for (size_t i = 0; i < n && i < 32; i++)
+    char hex[2 * 80 + 1]; // the PUT KEY data field is 70 bytes
+    size_t cap = n < 80 ? n : 80;
+    for (size_t i = 0; i < cap; i++)
         snprintf(&hex[i * 2], 3, "%02x", b[i]);
     Serial.printf("  %s = %s\n", label, hex);
 }
@@ -1074,6 +1109,142 @@ void SE050::benchScp03Kat()
     benchHex("cardChallenge ", lastCardChallenge, 8);
     benchHex("cardCryptogram", lastCardCryptogram, 8);
 }
+
+#ifdef SE050_ALLOW_ROTATION
+// --- Platform SCP03 key rotation (bench only, -D SE050_ALLOW_ROTATION) ------------
+//
+// Replaces NXP's public factory keys with per-device keys so only this host can open
+// the channel of this chip. The framing matches NXP's own demo byte for byte
+// (se05x_RotatePlatformSCP03Keys/se05x_TP_PlatformSCP03keys.c, createKeyData); it is
+// cross-checked against tools/scp03_rotate.py, and dryRunRotation() prints the same
+// bytes without sending so the two can be diffed on-device before anything is sent.
+
+static void deriveOne(const uint8_t *master, size_t mlen, const char *label, uint8_t out[16])
+{
+    SHA256 h;
+    h.reset();
+    h.update(master, mlen);
+    h.update(label, strlen(label));
+    uint8_t full[32];
+    h.finalize(full, sizeof(full));
+    memcpy(out, full, 16);
+}
+
+void SE050::deriveRotatedKeys(uint8_t enc[16], uint8_t mac[16], uint8_t dek[16])
+{
+    static const uint8_t master[] = SE050_ROTATION_MASTER;
+    deriveOne(master, sizeof(master), "SCP03-ENC", enc);
+    deriveOne(master, sizeof(master), "SCP03-MAC", mac);
+    deriveOne(master, sizeof(master), "SCP03-DEK", dek);
+}
+
+int SE050::buildPutKeyData(uint8_t *data, uint8_t *expected)
+{
+    // Encrypt each new component under the CURRENT DEK (factory on a virgin chip).
+    const uint8_t *dekNow = usingRotatedKeys ? curDek : SCP_KEY_DEK;
+
+    uint8_t nEnc[16], nMac[16], nDek[16];
+    deriveRotatedKeys(nEnc, nMac, nDek);
+    const uint8_t *newKeys[3] = {nEnc, nMac, nDek};
+
+    uint8_t zero[16] = {};
+    uint8_t ones[16];
+    memset(ones, 0x01, sizeof(ones));
+
+    int p = 0, e = 0;
+    data[p++] = SCP03_KEYVER; // KVN to replace
+    expected[e++] = SCP03_KEYVER;
+    for (int k = 0; k < 3; k++) {
+        uint8_t encComp[16], kcvFull[16];
+        cbc(dekNow, zero, newKeys[k], 16, encComp, true); // AES-CBC, IV 0, one block = ECB
+        cbc(newKeys[k], zero, ones, 16, kcvFull, true);   // KCV = AES-ECB(newKey, 01..)[:3]
+        data[p++] = 0x88;                                  // GPCS_KEY_TYPE_AES
+        data[p++] = 16 + 1;                                // length of AES key data
+        data[p++] = 16;                                    // length of AES key
+        memcpy(&data[p], encComp, 16);
+        p += 16;
+        data[p++] = 3; // CRYPTO_KEY_CHECK_LEN
+        memcpy(&data[p], kcvFull, 3);
+        p += 3;
+        memcpy(&expected[e], kcvFull, 3);
+        e += 3;
+    }
+    return p;
+}
+
+void SE050::dryRunRotation()
+{
+    uint8_t nEnc[16], nMac[16], nDek[16];
+    deriveRotatedKeys(nEnc, nMac, nDek);
+    Serial.println("[se050] rotation DRY RUN (nothing is sent):");
+    benchHex("new ENC", nEnc, 16);
+    benchHex("new MAC", nMac, 16);
+    benchHex("new DEK", nDek, 16);
+
+    uint8_t data[128], expected[16];
+    int len = buildPutKeyData(data, expected);
+    const uint8_t hdr[4] = {0x80, 0xD8, SCP03_KEYVER, 0x81};
+    benchHex("APDU header (->0x84 wrapped)", hdr, 4);
+    Serial.printf("  Lc = %d\n", len);
+    benchHex("PUT KEY data", data, len);
+    benchHex("expected response (KVN+3 KCV)", expected, 10);
+    Serial.println("  compare with: tools/scp03_rotate.py plan <ENC> <MAC> <DEK>");
+}
+
+bool SE050::rotatePlatformKeys()
+{
+    if (!scp.open) {
+        LOG_ERROR("SE050: rotation needs an open channel with the current keys");
+        return false;
+    }
+    if (usingRotatedKeys) {
+        LOG_WARN("SE050: this chip already runs rotated keys, nothing to do");
+        return true;
+    }
+
+    uint8_t data[128], expected[16];
+    int len = buildPutKeyData(data, expected);
+    uint8_t nEnc[16], nMac[16], nDek[16];
+    deriveRotatedKeys(nEnc, nMac, nDek); // same derivation buildPutKeyData used
+
+    LOG_WARN("SE050: sending PUT KEY - this is irreversible");
+    const uint8_t hdr[4] = {0x80, 0xD8, SCP03_KEYVER, 0x81};
+    uint8_t resp[32];
+    uint16_t sw = 0;
+    int rl = secureApdu(hdr, data, len, true, resp, sizeof(resp), &sw);
+    if (sw != 0x9000) {
+        LOG_ERROR("SE050: PUT KEY SW=%04x - the chip rejected it, keys NOT changed", sw);
+        return false;
+    }
+    if (rl != 10 || memcmp(resp, expected, 10) != 0) {
+        LOG_ERROR("SE050: PUT KEY echoed unexpected KCVs (rl=%d) - stored keys may be wrong", rl);
+        // do not adopt; the channel is still on the old keys, so the chip is still usable
+        return false;
+    }
+    LOG_INFO("SE050: PUT KEY accepted, chip echoed the expected KVN+KCVs");
+
+    // Adopt the new keys and reopen the channel to prove they actually work end to end.
+    memcpy(curEnc, nEnc, 16);
+    memcpy(curMac, nMac, 16);
+    memcpy(curDek, nDek, 16);
+    usingRotatedKeys = true;
+    scp.open = sessionActive = false;
+    if (!open() || !tryOpenChannel()) {
+        LOG_ERROR("SE050: CANNOT reopen with the new keys - rotation is bad, chip may be lost");
+        return false;
+    }
+    uint8_t pub[32];
+    if (!identityEnsure(pub))
+        LOG_WARN("SE050: channel reopened but the identity is not reachable - check the chip");
+
+    Serial.println("[se050] rotation CONFIRMED - channel reopens with the per-device keys:");
+    benchHex("new ENC", nEnc, 16);
+    benchHex("new MAC", nMac, 16);
+    benchHex("new DEK", nDek, 16);
+    Serial.println("  (reproducible from SE050_ROTATION_MASTER; the chip now rejects the factory keys)");
+    return true;
+}
+#endif // SE050_ALLOW_ROTATION
 
 void SE050::faultInject(char what)
 {
