@@ -129,6 +129,19 @@ static bool reticulumSetup()
             return false;
         }
 
+        // Transport identity. Transport::start() creates one on LittleFS unless it already
+        // has one, so with an SE050 on the board it gets a pair of chip keys first (objIds
+        // RNTX / RNTS). It signs the rnstransport.probe and remote-management proofs.
+        if (se050) {
+            RNS::Identity transport = se050Identity(*se050, VAULT_TRANSPORT_EXCHANGE_OBJ, VAULT_TRANSPORT_SIGNING_OBJ);
+            if (transport) {
+                RNS::Transport::identity(transport);
+                Serial.println("[node] transport identity keys live in the SE050");
+            } else {
+                Serial.println("[node] SE050 present but transport keys are not usable, Transport falls back to LittleFS");
+            }
+        }
+
         reticulum.transport_enabled(true);
         reticulum.probe_destination_enabled(true);
         reticulum.remote_management_enabled(true);
@@ -140,16 +153,10 @@ static bool reticulumSetup()
         // rebuilt from the chip's public keys on every boot, and the hash is the same as
         // long as the chip is. Without a chip, the software identity on LittleFS as before.
         if (se050) {
-            uint8_t exchangePublic[32], signingPublic[32];
-            if (se050->identityEnsure(exchangePublic) && se050->signingEnsure(signingPublic)) {
-                RNS::Identity vault(false);
-                if (vault.load_private_keys(std::make_shared<Se050ExchangeKey>(*se050, exchangePublic),
-                                            std::make_shared<Se050SigningKey>(*se050, signingPublic))) {
-                    node_identity = vault;
-                    Serial.println("[node] application identity keys live in the SE050");
-                }
-            }
-            if (!node_identity)
+            node_identity = se050Identity(*se050, SE050::IDENTITY_OBJ, SE050::SIGNING_OBJ);
+            if (node_identity)
+                Serial.println("[node] application identity keys live in the SE050");
+            else
                 Serial.println("[node] SE050 present but its keys are not usable, falling back to LittleFS");
         }
         if (!node_identity && RNS::Utilities::OS::file_exists(NODE_IDENTITY_PATH))

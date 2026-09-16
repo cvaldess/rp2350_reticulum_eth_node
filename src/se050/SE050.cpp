@@ -701,8 +701,6 @@ void SE050::reverse(const uint8_t *in, uint8_t *out, size_t len)
 
 namespace
 {
-constexpr uint32_t IDENTITY_OBJ = 0x4D544944u; // "MTID", the node's X25519 identity
-constexpr uint32_t SIGNING_OBJ = 0x524E5353u;  // "RNSS", the node's Ed25519 signing key
 // "MTKY", the mirrored copy of the key Meshtastic already holds in its config.
 // Deliberately a different object from MTID so the chip-generated identity, and
 // the self-test that leans on it, stay intact.
@@ -793,54 +791,194 @@ bool SE050::identitySession()
     return true;
 }
 
-bool SE050::identityEnsure(uint8_t publicKey[32])
+bool SE050::x25519Ensure(uint32_t objId, uint8_t publicKey[32])
 {
-    identityReady = false;
     if (!identitySession())
         return false;
 
     uint8_t authId[4], keyId[4];
     be32(AUTH_OBJ, authId);
-    be32(IDENTITY_OBJ, keyId);
+    be32(objId, keyId);
 
     uint8_t r[192];
     uint16_t sw = 0;
     int rl, vl;
     const uint8_t *v;
 
-    // Read the identity; if it is not there, generate it. Generation is persistent,
-    // so this only ever happens once per chip.
-    {
-        const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
-        uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
-        rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
+    // Read the key; if it is not there, generate it. Generation is persistent,
+    // so this only ever happens once per object.
+    const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
+    uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
+    rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
+    if (sw != 0x9000) {
+        LOG_INFO("SE050: no X25519 key at 0x%08x yet, generating it in-chip", (unsigned)objId);
+        const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00}; // P1_KEY_PAIR | P1_EC, no TAG_3/4: the chip generates
+        // Policy: bound to the UserID authenticator, allowing key agreement
+        // (AR header 0x043C0000: ALLOW_KA | READ | WRITE | GEN | DELETE).
+        uint8_t dGen[] = {0x11, 0x09, 0x08, authId[0], authId[1], authId[2], authId[3], 0x04, 0x3C, 0x00,
+                          0x00, 0x41, 0x04, keyId[0],  keyId[1],  keyId[2],  keyId[3],  0x42, 0x01, 0x41};
+        sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
         if (sw != 0x9000) {
-            LOG_INFO("SE050: no identity yet, generating X25519 in-chip (objId 0x%08x)", (unsigned)IDENTITY_OBJ);
-            const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00};
-            // Policy: bound to the UserID authenticator, allowing key agreement.
-            uint8_t dGen[] = {0x11, 0x09, 0x08, authId[0], authId[1], authId[2], authId[3], 0x04, 0x3C, 0x00,
-                              0x00, 0x41, 0x04, keyId[0],  keyId[1],  keyId[2],  keyId[3],  0x42, 0x01, 0x41};
-            sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
-            if (sw != 0x9000) {
-                LOG_ERROR("SE050: WriteECKey SW=%04x", sw);
-                return false;
-            }
-            rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
-            if (sw != 0x9000) {
-                LOG_ERROR("SE050: ReadObject SW=%04x", sw);
-                return false;
-            }
-        } else {
-            LOG_INFO("SE050: reusing existing identity (objId 0x%08x)", (unsigned)IDENTITY_OBJ);
-        }
-        v = tlv1(r, rl, &vl);
-        if (!v || vl < 32) {
-            LOG_ERROR("SE050: unexpected public key length %d", vl);
+            LOG_ERROR("SE050: WriteECKey (X25519 0x%08x) SW=%04x", (unsigned)objId, sw);
             return false;
         }
-        reverse(v, publicKey, 32); // the SE050 reports big-endian
+        rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
+        if (sw != 0x9000) {
+            LOG_ERROR("SE050: ReadObject (X25519 0x%08x) SW=%04x", (unsigned)objId, sw);
+            return false;
+        }
+    } else {
+        LOG_INFO("SE050: reusing X25519 key at 0x%08x", (unsigned)objId);
+    }
+    v = tlv1(r, rl, &vl);
+    if (!v || vl < 32) {
+        LOG_ERROR("SE050: unexpected public key length %d", vl);
+        return false;
+    }
+    reverse(v, publicKey, 32); // the SE050 reports big-endian
+    return true;
+}
+
+bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32])
+{
+    if (!sessionActive || reentered("x25519Ecdh"))
+        return false;
+
+    uint8_t keyId[4];
+    be32(objId, keyId);
+    uint8_t peerBe[32];
+    reverse(peerPublic, peerBe, 32);
+
+    const uint8_t h[4] = {0x80, 0x03, 0x01, 0x0F}; // INS_CRYPTO, P1_EC, P2_DH
+    uint8_t d[40];
+    int j = 0;
+    d[j++] = 0x41; // TAG_1: the on-chip private key
+    d[j++] = 0x04;
+    memcpy(&d[j], keyId, 4);
+    j += 4;
+    d[j++] = 0x42; // TAG_2: peer public key, big-endian
+    d[j++] = 0x20;
+    memcpy(&d[j], peerBe, 32);
+    j += 32;
+
+    uint8_t r[128];
+    uint16_t sw = 0;
+    int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
+    if (sw != 0x9000) {
+        LOG_ERROR("SE050: ECDH (0x%08x) SW=%04x", (unsigned)objId, sw);
+        return false;
+    }
+    int vl;
+    const uint8_t *v = tlv1(r, rl, &vl);
+    if (!v || vl != 32)
+        return false;
+    reverse(v, shared, 32);
+    return true;
+}
+
+bool SE050::ed25519Ensure(uint32_t objId, uint8_t publicKey[32])
+{
+    if (!identitySession())
+        return false;
+
+    uint8_t authId[4], keyId[4];
+    be32(AUTH_OBJ, authId);
+    be32(objId, keyId);
+
+    uint8_t r[192];
+    uint16_t sw = 0;
+    int rl, vl;
+    const uint8_t *v;
+
+    // Same shape as x25519Ensure: read it, and generate it in the chip the one
+    // time it is not there.
+    const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
+    uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
+    rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
+    if (sw != 0x9000) {
+        LOG_INFO("SE050: no Ed25519 key at 0x%08x yet, generating it in-chip", (unsigned)objId);
+        const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00}; // P1_KEY_PAIR | P1_EC, no TAG_3/4: the chip generates
+        // Policy: bound to the UserID authenticator, allowing sign and verify
+        // (AR header 0x183C0000: ALLOW_SIGN | ALLOW_VERIFY | READ | WRITE | GEN | DELETE).
+        uint8_t dGen[] = {0x11, 0x09, 0x08, authId[0], authId[1], authId[2], authId[3], 0x18, 0x3C, 0x00,
+                          0x00, 0x41, 0x04, keyId[0],  keyId[1],  keyId[2],  keyId[3],  0x42, 0x01, 0x40};
+        sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
+        if (sw != 0x9000) {
+            LOG_ERROR("SE050: WriteECKey (Ed25519 0x%08x) SW=%04x", (unsigned)objId, sw);
+            return false;
+        }
+        rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
+        if (sw != 0x9000) {
+            LOG_ERROR("SE050: ReadObject (Ed25519 0x%08x) SW=%04x", (unsigned)objId, sw);
+            return false;
+        }
+    } else {
+        LOG_INFO("SE050: reusing Ed25519 key at 0x%08x", (unsigned)objId);
+    }
+    v = tlv1(r, rl, &vl);
+    if (!v || vl != 32) {
+        LOG_ERROR("SE050: unexpected Ed25519 public key length %d", vl);
+        return false;
+    }
+    reverse(v, publicKey, 32); // the SE050 reports it big-endian (AN12413 7.1)
+    return true;
+}
+
+bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint8_t signature[64])
+{
+    if (!sessionActive || reentered("ed25519Sign"))
+        return false;
+    if (len > SIGN_MAX_MESSAGE) {
+        LOG_ERROR("SE050: message of %u bytes exceeds the %u-byte signing limit", (unsigned)len, (unsigned)SIGN_MAX_MESSAGE);
+        return false;
     }
 
+    uint8_t keyId[4];
+    be32(objId, keyId);
+
+    const uint8_t h[4] = {0x80, 0x03, 0x0C, 0x09}; // INS_CRYPTO, P1_SIGNATURE, P2_SIGN
+    uint8_t d[12 + SIGN_MAX_MESSAGE];
+    int j = 0;
+    d[j++] = 0x41; // TAG_1: the on-chip signing key
+    d[j++] = 0x04;
+    memcpy(&d[j], keyId, 4);
+    j += 4;
+    d[j++] = 0x42; // TAG_2: EDSignatureAlgo
+    d[j++] = 0x01;
+    d[j++] = 0xA3; // SIG_ED25519PURE, the chip runs SHA-512 over the plain message
+    d[j++] = 0x43; // TAG_3: the message, BER length
+    if (len > 0x7F)
+        d[j++] = 0x81;
+    d[j++] = (uint8_t)len;
+    memcpy(&d[j], message, len);
+    j += len;
+
+    uint8_t r[96];
+    uint16_t sw = 0;
+    int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
+    if (sw != 0x9000) {
+        LOG_ERROR("SE050: EdDSASign (0x%08x) SW=%04x", (unsigned)objId, sw);
+        return false;
+    }
+    int vl;
+    const uint8_t *v = tlv1(r, rl, &vl);
+    if (!v || vl != 64) {
+        LOG_ERROR("SE050: unexpected signature length %d", vl);
+        return false;
+    }
+    // r and s come back reversed, each on its own (AN12413 7.1, figure 19).
+    reverse(v, signature, 32);
+    reverse(v + 32, signature + 32, 32);
+    return true;
+}
+
+// --- The node identity: wrappers the self-test and the Meshtastic port use ----
+
+bool SE050::identityEnsure(uint8_t publicKey[32])
+{
+    identityReady = false;
+    if (!x25519Ensure(IDENTITY_OBJ, publicKey))
+        return false;
     activeKeyObj = IDENTITY_OBJ;
     identityReady = true;
     return true;
@@ -973,138 +1111,22 @@ bool SE050::identityImport(const uint8_t privateKey[32], uint8_t publicKeyOut[32
 
 bool SE050::identityEcdh(const uint8_t peerPublic[32], uint8_t shared[32])
 {
-    if (!identityReady || reentered("identityEcdh"))
+    if (!identityReady)
         return false;
-
-    uint8_t keyId[4];
-    be32(activeKeyObj, keyId);
-    uint8_t peerBe[32];
-    reverse(peerPublic, peerBe, 32);
-
-    const uint8_t h[4] = {0x80, 0x03, 0x01, 0x0F}; // INS_CRYPTO, P1_EC, P2_DH
-    uint8_t d[40];
-    int j = 0;
-    d[j++] = 0x41; // TAG_1: the on-chip private key
-    d[j++] = 0x04;
-    memcpy(&d[j], keyId, 4);
-    j += 4;
-    d[j++] = 0x42; // TAG_2: peer public key, big-endian
-    d[j++] = 0x20;
-    memcpy(&d[j], peerBe, 32);
-    j += 32;
-
-    uint8_t r[128];
-    uint16_t sw = 0;
-    int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
-    if (sw != 0x9000) {
-        LOG_ERROR("SE050: ECDH SW=%04x", sw);
-        return false;
-    }
-    int vl;
-    const uint8_t *v = tlv1(r, rl, &vl);
-    if (!v || vl != 32)
-        return false;
-    reverse(v, shared, 32);
-    return true;
+    return x25519Ecdh(activeKeyObj, peerPublic, shared);
 }
 
 bool SE050::signingEnsure(uint8_t publicKey[32])
 {
-    signingReady = false;
-    if (!identitySession())
-        return false;
-
-    uint8_t authId[4], keyId[4];
-    be32(AUTH_OBJ, authId);
-    be32(SIGNING_OBJ, keyId);
-
-    uint8_t r[192];
-    uint16_t sw = 0;
-    int rl, vl;
-    const uint8_t *v;
-
-    // Same shape as identityEnsure: read it, and generate it in the chip the one
-    // time it is not there.
-    const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
-    uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
-    rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
-    if (sw != 0x9000) {
-        LOG_INFO("SE050: no signing key yet, generating Ed25519 in-chip (objId 0x%08x)", (unsigned)SIGNING_OBJ);
-        const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00}; // P1_KEY_PAIR | P1_EC, no TAG_3/4: the chip generates
-        // Policy: bound to the UserID authenticator, allowing sign and verify
-        // (AR header 0x183C0000: ALLOW_SIGN | ALLOW_VERIFY | READ | WRITE | GEN | DELETE).
-        uint8_t dGen[] = {0x11, 0x09, 0x08, authId[0], authId[1], authId[2], authId[3], 0x18, 0x3C, 0x00,
-                          0x00, 0x41, 0x04, keyId[0],  keyId[1],  keyId[2],  keyId[3],  0x42, 0x01, 0x40};
-        sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
-        if (sw != 0x9000) {
-            LOG_ERROR("SE050: WriteECKey (Ed25519) SW=%04x", sw);
-            return false;
-        }
-        rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
-        if (sw != 0x9000) {
-            LOG_ERROR("SE050: ReadObject (Ed25519) SW=%04x", sw);
-            return false;
-        }
-    } else {
-        LOG_INFO("SE050: reusing existing signing key (objId 0x%08x)", (unsigned)SIGNING_OBJ);
-    }
-    v = tlv1(r, rl, &vl);
-    if (!v || vl != 32) {
-        LOG_ERROR("SE050: unexpected Ed25519 public key length %d", vl);
-        return false;
-    }
-    reverse(v, publicKey, 32); // the SE050 reports it big-endian (AN12413 7.1)
-
-    signingReady = true;
-    return true;
+    signingReady = ed25519Ensure(SIGNING_OBJ, publicKey);
+    return signingReady;
 }
 
 bool SE050::sign(const uint8_t *message, size_t len, uint8_t signature[64])
 {
-    if (!signingReady || reentered("sign"))
+    if (!signingReady)
         return false;
-    if (len > SIGN_MAX_MESSAGE) {
-        LOG_ERROR("SE050: message of %u bytes exceeds the %u-byte signing limit", (unsigned)len, (unsigned)SIGN_MAX_MESSAGE);
-        return false;
-    }
-
-    uint8_t keyId[4];
-    be32(SIGNING_OBJ, keyId);
-
-    const uint8_t h[4] = {0x80, 0x03, 0x0C, 0x09}; // INS_CRYPTO, P1_SIGNATURE, P2_SIGN
-    uint8_t d[12 + SIGN_MAX_MESSAGE];
-    int j = 0;
-    d[j++] = 0x41; // TAG_1: the on-chip signing key
-    d[j++] = 0x04;
-    memcpy(&d[j], keyId, 4);
-    j += 4;
-    d[j++] = 0x42; // TAG_2: EDSignatureAlgo
-    d[j++] = 0x01;
-    d[j++] = 0xA3; // SIG_ED25519PURE, the chip runs SHA-512 over the plain message
-    d[j++] = 0x43; // TAG_3: the message, BER length
-    if (len > 0x7F)
-        d[j++] = 0x81;
-    d[j++] = (uint8_t)len;
-    memcpy(&d[j], message, len);
-    j += len;
-
-    uint8_t r[96];
-    uint16_t sw = 0;
-    int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
-    if (sw != 0x9000) {
-        LOG_ERROR("SE050: EdDSASign SW=%04x", sw);
-        return false;
-    }
-    int vl;
-    const uint8_t *v = tlv1(r, rl, &vl);
-    if (!v || vl != 64) {
-        LOG_ERROR("SE050: unexpected signature length %d", vl);
-        return false;
-    }
-    // r and s come back reversed, each on its own (AN12413 7.1, figure 19).
-    reverse(v, signature, 32);
-    reverse(v + 32, signature + 32, 32);
-    return true;
+    return ed25519Sign(SIGNING_OBJ, message, len, signature);
 }
 
 bool SE050::probe()

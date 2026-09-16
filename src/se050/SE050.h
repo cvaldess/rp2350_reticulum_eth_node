@@ -59,6 +59,31 @@ class SE050
     // only be reproduced with the right static keys and KDF.
     bool openSecureChannel();
 
+    // --- Keys by object id -------------------------------------------------
+    //
+    // The vault API: any number of X25519 / Ed25519 key pairs, each addressed by
+    // its SE050 object id, all generated in the chip on first use and bound to the
+    // same UserID authenticator. Private halves never leave the chip. Public keys
+    // and peer keys are in RFC 7748 / RFC 8032 order; the chip works big-endian and
+    // the reversal happens here (AN12413 section 7). All need an open secure channel.
+
+    // Well-known object ids. IDENTITY_OBJ / SIGNING_OBJ back the boot self-test and
+    // the node's application identity, so their public keys are its identity hash.
+    static constexpr uint32_t IDENTITY_OBJ = 0x4D544944u; // "MTID", X25519 (the Meshtastic port's identity)
+    static constexpr uint32_t SIGNING_OBJ = 0x524E5353u;  // "RNSS", Ed25519
+
+    // X25519 key pair at objId: read its public key, generating the pair if absent.
+    bool x25519Ensure(uint32_t objId, uint8_t publicKey[32]);
+    // One key agreement with the private key at objId. AN12413 4.10.3: an NVM write per call.
+    bool x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32]);
+    // Ed25519 key pair at objId: read its public key, generating the pair if absent.
+    bool ed25519Ensure(uint32_t objId, uint8_t publicKey[32]);
+    // EdDSA pure (RFC 8032) over message with the key at objId; the chip hashes the
+    // plain message itself. Signature is r||s in RFC order. len <= SIGN_MAX_MESSAGE.
+    bool ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint8_t signature[64]);
+
+    // --- The node identity (wrappers over the above, kept for the self-test) -----
+
     // Ensures this node has an X25519 identity inside the SE050, generating it on
     // first use and reusing it afterwards. The private half is created in the chip
     // and never leaves it. Returns the public key, little-endian as the rest of
@@ -92,9 +117,7 @@ class SE050
     // EdDSASign TLVs 12 more, so 207 is the ceiling and 200 keeps a margin.
     static constexpr size_t SIGN_MAX_MESSAGE = 200;
 
-    // EdDSA pure (RFC 8032) over message with the on-chip signing key. The chip
-    // hashes the plain message itself. Signature is r||s in RFC order; the chip
-    // returns each half reversed and they are put right here.
+    // EdDSA pure (RFC 8032) over message with the on-chip signing key (SIGNING_OBJ).
     bool sign(const uint8_t *message, size_t len, uint8_t signature[64]);
 
     // Bring-up check for all four layers.
