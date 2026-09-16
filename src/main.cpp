@@ -107,6 +107,12 @@ static void handleConsole()
                 Serial.printf("littlefs total=%llu used=%llu\n", info.totalBytes, info.usedBytes);
             break;
         }
+        case 'l': {
+            fs::Dir dir = LittleFS.openDir("/");
+            while (dir.next())
+                Serial.printf("  %s%s %u\n", dir.fileName().c_str(), dir.isDirectory() ? "/" : "", dir.fileSize());
+            break;
+        }
         default:
             break;
         }
