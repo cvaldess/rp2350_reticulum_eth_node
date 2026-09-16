@@ -1,14 +1,16 @@
-// rp2350_reticulum_eth_node — phase 1: Reticulum transport node reachable over Ethernet.
+// rp2350_reticulum_eth_node — phase 2: Reticulum transport node bridging LoRa and Ethernet.
 //
 // Phase 0 proved the stack lives on the RP2350 (identity persists, TRNG-seeded RNG).
-// Phase 1 adds the W5500 and a TCPClientInterface to an rnsd on the LAN, plus an
-// application destination that is announced periodically so the host can see this node.
+// Phase 1 added the W5500 and a TCPClientInterface to an rnsd on the LAN.
+// Phase 2 adds the E22 LoRa interface; a NODE_DISABLE_TCP build is the LoRa-only peer.
+// Each node announces an application destination so the hosts can see it exists.
 
 #include <Arduino.h>
 #include <microReticulum.h>
 #include <microStore/FileSystem.h>
 
 #include "EthernetLink.h"
+#include "LoRaInterface.h"
 #include "PicoLittleFSFileSystem.h"
 #include "Rp2350Trng.h"
 #include "TCPClientInterface.h"
@@ -17,12 +19,14 @@
 
 static RNS::Reticulum reticulum({RNS::Type::NONE});
 static RNS::Interface tcp_interface({RNS::Type::NONE});
+static RNS::Interface lora_interface({RNS::Type::NONE});
 static RNS::Identity node_identity({RNS::Type::NONE});
 static RNS::Destination node_destination({RNS::Type::NONE});
 static microStore::Adapters::PicoLittleFSFileSystem filesystem;
 static Rp2350Trng trng;
 static EthernetLink eth;
 static TCPClientInterface *tcp = nullptr;
+static LoRaInterface *lora = nullptr;
 
 static uint32_t lastAnnounce = 0;
 static bool announcePending = false;
@@ -77,11 +81,24 @@ static bool reticulumSetup()
             return false;
         }
 
+#ifndef NODE_DISABLE_TCP
         tcp = new TCPClientInterface("TCPClientInterface", parseIp(RNS_TCP_TARGET_HOST), RNS_TCP_TARGET_PORT);
         tcp_interface = tcp;
         tcp_interface.mode(RNS::Type::Interface::MODE_FULL);
         RNS::Transport::register_interface(tcp_interface);
         tcp_interface.start();
+#endif
+
+        LoRaInterface::Params lp = {LORA_FREQUENCY_MHZ,   LORA_BANDWIDTH_KHZ,    LORA_SPREADING_FACTOR,
+                                    LORA_CODING_RATE,     LORA_PREAMBLE_SYMBOLS, LORA_TX_POWER_DBM};
+        lora = new LoRaInterface("LoRaInterface", lp);
+        lora_interface = lora;
+        lora_interface.mode(RNS::Type::Interface::MODE_FULL);
+        RNS::Transport::register_interface(lora_interface);
+        if (!lora_interface.start()) {
+            Serial.println("FATAL: LoRa radio did not initialise");
+            return false;
+        }
 
         reticulum.transport_enabled(true);
         reticulum.probe_destination_enabled(true);
@@ -133,6 +150,10 @@ static void handleConsole()
             if (tcp)
                 Serial.printf("[tcp] %s reconnects=%lu\n", tcp->connected() ? "connected" : "disconnected",
                               (unsigned long)tcp->reconnects());
+            if (lora)
+                Serial.printf("[lora] %s rx=%lu tx=%lu last rssi %.1f snr %.1f\n",
+                              lora->online() ? "online" : "offline", (unsigned long)lora->rxFrames(),
+                              (unsigned long)lora->txFrames(), lora->lastRssi(), lora->lastSnr());
             break;
         case 'a':
             announceNow("console");
@@ -164,7 +185,7 @@ void setup()
         delay(50);
 
     Serial.println();
-    Serial.println("rp2350_reticulum_eth_node phase 1");
+    Serial.println("rp2350_reticulum_eth_node phase 2");
     printHeap("boot");
 
     eth.begin();
@@ -190,9 +211,10 @@ void loop()
     reticulum.loop();
     handleConsole();
 
-    // First announce a few seconds after the TCP link comes up, then every NODE_ANNOUNCE_INTERVAL_S.
+    // First announce a few seconds after the node is reachable (TCP link up, or LoRa alone on a
+    // LoRa-only build), then every NODE_ANNOUNCE_INTERVAL_S.
     static uint32_t onlineSince = 0;
-    bool online = tcp && tcp->connected();
+    bool online = (tcp && tcp->connected()) || (!tcp && lora && lora->online());
     if (!online) {
         onlineSince = 0;
     } else if (onlineSince == 0) {
