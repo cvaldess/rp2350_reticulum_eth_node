@@ -123,6 +123,13 @@ class SE050
     // Bring-up check for all four layers.
     bool probe();
 
+    // Last resort for recover(): called when the chip does not answer the T=1
+    // interface reset, i.e. it is wedged or unpowered. The board owns the ENA pin
+    // (only some carriers have it wired), so it supplies the pulse; the driver
+    // just knows when nothing short of a power-on reset will do.
+    using PowerCycleFn = void (*)();
+    void onPowerCycle(PowerCycleFn fn) { powerCycle = fn; }
+
     // Bench-only fault injection for the recovery path. 'c' advances the host SCP03
     // counter so the chip rejects the next C-MAC; 's' corrupts the session id so the
     // next ProcessSessionCmd names a session the chip does not know. A chip reset
@@ -229,6 +236,7 @@ class SE050
     // the mirrored node key, depending on which path prepared it.
     uint32_t activeKeyObj = 0;
     bool signingReady = false;
+    PowerCycleFn powerCycle = nullptr;
 };
 
 // The instance the boot probe left behind, or null if this board has no SE050 or

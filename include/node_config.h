@@ -17,6 +17,7 @@
 #define NODE_APP_NAME "rp2350node"
 #define NODE_APP_ASPECT "status"
 #define NODE_ANNOUNCE_INTERVAL_S 120
+#define NODE_ANNOUNCE_RETRY_S 30 // spacing between attempts when one fails (identity could not sign)
 #define NODE_ANNOUNCE_APP_DATA "rp2350_reticulum_eth_node"
 
 // Where the application identity lives on LittleFS when there is no SE050 (with one, both

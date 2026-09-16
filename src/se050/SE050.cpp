@@ -802,17 +802,31 @@ bool SE050::identitySession()
 
 bool SE050::recover(const char *what)
 {
+    uint32_t t0 = millis();
     LOG_WARN("SE050: %s found the channel down, rebuilding applet select, SCP03 and the session", what);
     scp.open = sessionActive = false;
-    if (!open()) {
-        LOG_ERROR("SE050: chip does not answer the interface reset");
+    bool up = open();
+    if (!up && powerCycle) {
+        // No answer to the interface reset: wedged or unpowered. An unpowered chip
+        // NACKs the I2C write and fails in milliseconds; a wedged one that ACKs and
+        // stays silent costs the full poll window per attempt first. ENA low/high is
+        // the only power-on reset the chip can get from here.
+        LOG_WARN("SE050: no answer to the interface reset after %u ms, power-cycling the chip", (unsigned)(millis() - t0));
+        powerCycle();
+        up = open();
+    }
+    if (!up) {
+        LOG_ERROR("SE050: chip does not answer the interface reset, gave up after %u ms", (unsigned)(millis() - t0));
         return false;
     }
     if (!openSecureChannel()) {
         LOG_ERROR("SE050: secure channel could not be reopened");
         return false;
     }
-    return identitySession();
+    if (!identitySession())
+        return false;
+    LOG_INFO("SE050: channel rebuilt in %u ms", (unsigned)(millis() - t0));
+    return true;
 }
 
 bool SE050::ensureSession(const char *what)
@@ -943,6 +957,7 @@ bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t sha
 
     uint8_t r[128];
     uint16_t sw = 0;
+    uint32_t t0 = millis();
     for (int attempt = 0; attempt < 2; attempt++) {
         if (!ensureSession("x25519Ecdh"))
             return false;
@@ -953,6 +968,8 @@ bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t sha
             if (!v || vl != 32)
                 return false;
             reverse(v, shared, 32);
+            if (attempt > 0)
+                LOG_INFO("SE050: ECDH completed on the retry, %u ms end to end", (unsigned)(millis() - t0));
             return true;
         }
         // A live session with an existing key and this policy cannot refuse a key
@@ -995,6 +1012,7 @@ bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint
 
     uint8_t r[96];
     uint16_t sw = 0;
+    uint32_t t0 = millis();
     for (int attempt = 0; attempt < 2; attempt++) {
         if (!ensureSession("ed25519Sign"))
             return false;
@@ -1009,6 +1027,8 @@ bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint
             // r and s come back reversed, each on its own (AN12413 7.1, figure 19).
             reverse(v, signature, 32);
             reverse(v + 32, signature + 32, 32);
+            if (attempt > 0)
+                LOG_INFO("SE050: signature completed on the retry, %u ms end to end", (unsigned)(millis() - t0));
             return true;
         }
         // Same reasoning as x25519Ecdh: this cannot be a policy refusal.

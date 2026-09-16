@@ -53,22 +53,33 @@ extern "C" int _write(int file, char *ptr, int len)
 // Secure element bring-up: the Meshtastic port's four-layer probe (T=1oI2C reset + applet
 // select, GetVersion/GetRandom, SCP03, on-chip X25519 identity + ECDH equivalence check).
 // Phase 3 hangs the Reticulum identity off this; tonight it only has to say hello and stay up.
-static void se050Setup()
-{
 #ifdef SE050_ENA_PIN
-    // ENA pulse = the only power-on reset the SE050 gets after an MCU reset (see the
-    // Meshtastic port). Only on carriers with the ENA hardware mod.
+// ENA pulse = the only power-on reset the SE050 gets after an MCU reset (see the
+// Meshtastic port), and the driver's last resort when the chip stops answering.
+// Only on carriers with the ENA hardware mod.
+static void se050PowerCycle()
+{
     pinMode(SE050_ENA_PIN, OUTPUT);
     digitalWrite(SE050_ENA_PIN, LOW);
     delay(5);
     digitalWrite(SE050_ENA_PIN, HIGH);
     delay(250);
+}
+#endif
+
+static void se050Setup()
+{
+#ifdef SE050_ENA_PIN
+    se050PowerCycle();
 #endif
     Wire.setSDA(I2C_SDA);
     Wire.setSCL(I2C_SCL);
     Wire.begin();
     Wire.setClock(100000);
     se050 = new SE050(Wire, SE050_I2C_ADDR);
+#ifdef SE050_ENA_PIN
+    se050->onPowerCycle(se050PowerCycle);
+#endif
     if (!se050->probe()) {
         Serial.println("[se050] not available on this board");
         delete se050;
@@ -120,13 +131,27 @@ static IPAddress parseIp(const char *s)
     return ip;
 }
 
-static void announceNow(const char *why)
+static void announceNow(const char *why, bool force = false)
 {
     if (!node_destination)
         return;
+    // A failed attempt (the chip did not sign) waits NODE_ANNOUNCE_RETRY_S before the
+    // next one, whatever asked for it: without this the "link up" retry fired once per
+    // loop pass while the chip was off. The console skips the wait.
+    if (!force && lastAnnounce != 0 && millis() - lastAnnounce < (uint32_t)NODE_ANNOUNCE_RETRY_S * 1000)
+        return;
+    lastAnnounce = millis();
     try {
-        node_destination.announce(RNS::bytesFromString(NODE_ANNOUNCE_APP_DATA));
-        lastAnnounce = millis();
+        // Build first, send second. announce() with send=true swallows a signing failure
+        // into its own log line and returns NONE in both cases; with send=false NONE means
+        // exactly "no packet", which with the keys in the SE050 means the chip did not sign.
+        RNS::Packet packet =
+            node_destination.announce(RNS::bytesFromString(NODE_ANNOUNCE_APP_DATA), false, {RNS::Type::NONE}, {}, false);
+        if (!packet) {
+            Serial.printf("[node] announce NOT sent (%s): the identity could not sign\n", why);
+            return;
+        }
+        packet.send();
         announcePending = false;
         Serial.printf("[node] announced %s (%s)\n", node_destination.hash().toHex().c_str(), why);
     } catch (const std::exception &e) {
@@ -287,14 +312,29 @@ static void handleConsole()
         case 'x': // the chip loses everything: SCP03 state, session, T=1 sequence
 #ifdef SE050_ENA_PIN
             Serial.println("[se050] fault: power-cycling the chip via ENA");
-            digitalWrite(SE050_ENA_PIN, LOW);
-            delay(5);
-            digitalWrite(SE050_ENA_PIN, HIGH);
-            delay(250);
+            se050PowerCycle();
 #else
             Serial.println("[se050] no ENA pin on this carrier, cannot power-cycle the chip");
 #endif
             break;
+        case 'y': // the chip goes away for good: ENA low and left there (I2C NACKs)
+#ifdef SE050_ENA_PIN
+            Serial.println("[se050] fault: chip powered off via ENA, left off");
+            digitalWrite(SE050_ENA_PIN, LOW);
+#else
+            Serial.println("[se050] no ENA pin on this carrier");
+#endif
+            break;
+        case 'Y': { // with or without the last resort, to see both behaviours
+#ifdef SE050_ENA_PIN
+            static bool lastResort = true;
+            lastResort = !lastResort;
+            if (se050)
+                se050->onPowerCycle(lastResort ? se050PowerCycle : nullptr);
+            Serial.printf("[se050] power-cycle last resort %s\n", lastResort ? "enabled" : "disabled");
+#endif
+            break;
+        }
         case 'X': // host and chip disagree about the SCP03 counter
             if (se050)
                 se050->faultInject('c');
@@ -314,7 +354,7 @@ static void handleConsole()
                               (unsigned long)lora->txFrames(), lora->lastRssi(), lora->lastSnr());
             break;
         case 'a':
-            announceNow("console");
+            announceNow("console", true);
             break;
         case 'f': {
             fs::FSInfo info;
