@@ -10,7 +10,7 @@ LOG=${1:-$HOME/soak.log}
 INTERVAL=${2:-300}
 RNS=$HOME/rns-venv/bin
 BENCH1=cae43b192c28e13f37f86f08c977ddd0   # identity in the SE050 since 2026-09-16 (was 7627f0e8... with software keys)
-BENCH2=cf2dae5f96da01003461109abc18e42a
+BENCH2=46f55ff2f4e1dc0c6a5495def7dd3d4f   # identity in the SE050 since 2026-09-16 (was cf2dae5f... with software keys)
 export PYTHONIOENCODING=utf-8
 
 echo "$(date '+%F %T') --- soak start interval=${INTERVAL}s" >> "$LOG"
