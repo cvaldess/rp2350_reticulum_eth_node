@@ -1,8 +1,10 @@
-// rp2350_reticulum_eth_node — phase 2: Reticulum transport node bridging LoRa and Ethernet.
+// rp2350_reticulum_eth_node — Reticulum transport node bridging LoRa and Ethernet.
 //
 // Phase 0 proved the stack lives on the RP2350 (identity persists, TRNG-seeded RNG).
 // Phase 1 added the W5500 and a TCPClientInterface to an rnsd on the LAN.
 // Phase 2 adds the E22 LoRa interface; a NODE_DISABLE_TCP build is the LoRa-only peer.
+// Phase 3 moved both identities into the SE050 (src/se050, VaultKeys.h).
+// Phase 4 adds the Ethernet OTA with a trial boot (Ota.h): USB is for the console only.
 // Each node announces an application destination so the hosts can see it exists.
 
 #include <Arduino.h>
@@ -12,6 +14,7 @@
 #include "EthernetLink.h"
 #include "LoRaInterface.h"
 #include "Ntp.h"
+#include "Ota.h"
 #include "PicoLittleFSFileSystem.h"
 #include "Rp2350Trng.h"
 #include "TCPClientInterface.h"
@@ -36,6 +39,7 @@ static LoRaInterface *lora = nullptr;
 
 static uint32_t lastAnnounce = 0;
 static bool announcePending = false;
+static bool announcedOnce = false; // an announce left this node signed: half of the OTA trial's proof
 
 static Ntp ntp(NODE_NTP_SERVER, NODE_NTP_FALLBACK_IP);
 static uint32_t lastClockSync = 0; // millis() of the last request, answered or not
@@ -153,6 +157,7 @@ static void announceNow(const char *why, bool force = false)
         }
         packet.send();
         announcePending = false;
+        announcedOnce = true;
         Serial.printf("[node] announced %s (%s)\n", node_destination.hash().toHex().c_str(), why);
     } catch (const std::exception &e) {
         Serial.printf("[node] announce failed: %s\n", e.what());
@@ -303,6 +308,9 @@ static void handleConsole()
         case 'h':
             printHeap("console");
             break;
+        case 'o':
+            ota.status(Serial);
+            break;
         case 's':
             Serial.printf("[se050] %s\n", se050 ? "present, probe passed at boot" : "absent");
             break;
@@ -409,8 +417,12 @@ void setup()
         delay(50);
 
     Serial.println();
-    Serial.println("rp2350_reticulum_eth_node phase 2");
+    Serial.println("rp2350_reticulum_eth_node phase 4 (Ethernet OTA)");
     printHeap("boot");
+
+    // Before anything that could fail: this is where a trial boot is counted and, if it is
+    // one too many, where the previous image is put back.
+    ota.begin();
 
     eth.begin();
     se050Setup();
@@ -436,6 +448,14 @@ void loop()
     reticulum.loop();
     handleConsole();
     clockLoop();
+    ota.loop();
+
+    // An OTA'd image has proved itself once the chip answered its probe and an announce went
+    // out signed by it: the vault works and the node is reachable. Until then it is on trial.
+#ifndef NODE_OTA_TEST_NO_CONFIRM // bench image that never confirms, to watch the rollback happen
+    if (ota.pending() && se050 && announcedOnce)
+        ota.confirm("SE050 probe passed and announce sent");
+#endif
 
     // First announce a few seconds after the node is reachable (TCP link up, or LoRa alone on a
     // LoRa-only build), then every NODE_ANNOUNCE_INTERVAL_S.

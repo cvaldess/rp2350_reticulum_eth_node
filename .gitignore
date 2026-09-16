@@ -6,8 +6,11 @@
 .DS_Store
 Thumbs.db
 bench/logs/
+include/build_id.h
 
 # NXP Plug&Trust MW (114 MB, not ours to redistribute)
 se05x_mw_v04.08.01.zip
 se05x_mw/
 simw-top/
+__pycache__/
+*.pyc

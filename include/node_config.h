@@ -38,3 +38,19 @@
 #define LORA_CODING_RATE 5
 #define LORA_PREAMBLE_SYMBOLS 8
 #define LORA_TX_POWER_DBM 10 // bench: boards a metre apart; raise once they are further away
+
+// Ethernet OTA (see docs/ota.md). The same wire as the Meshtastic fork's HTTP OTA: a nonce, a
+// SHA-256 over nonce||PSK to prove the uploader knows the key, the gzip'd image as the body.
+// The PSK is a bench value shared by both boards; a per-device key is the OTP task.
+#define NODE_OTA_PORT 4244
+#define NODE_OTA_PSK_HEX "43331e079ee9ce5ec2bf7bd10f91b0bf9aab2498d2ee71005dcc774b88bddb6c"
+#define NODE_OTA_NONCE_TTL_S 30
+#define NODE_OTA_AUTH_COOLDOWN_S 5
+// Trial boot after an OTA: the new image has to prove itself (SE050 probe passed and the
+// first announce went out signed) within this long, or it reboots; after this many unconfirmed
+// boots the previous image is put back. Overridable from the build (PLATFORMIO_BUILD_FLAGS) so a
+// bench image can exercise the rollback quickly; -D NODE_OTA_TEST_NO_CONFIRM makes it never confirm.
+#ifndef NODE_OTA_TRIAL_TIMEOUT_S
+#define NODE_OTA_TRIAL_TIMEOUT_S 600
+#endif
+#define NODE_OTA_TRIAL_BOOTS 3
