@@ -9,7 +9,7 @@
 LOG=${1:-$HOME/soak.log}
 INTERVAL=${2:-300}
 RNS=$HOME/rns-venv/bin
-BENCH1=7627f0e8ec86354da03e9d99ff1a41f6
+BENCH1=cae43b192c28e13f37f86f08c977ddd0   # identity in the SE050 since 2026-09-16 (was 7627f0e8... with software keys)
 BENCH2=cf2dae5f96da01003461109abc18e42a
 export PYTHONIOENCODING=utf-8
 

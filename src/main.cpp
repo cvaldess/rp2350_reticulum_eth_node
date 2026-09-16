@@ -15,6 +15,7 @@
 #include "Rp2350Trng.h"
 #include "TCPClientInterface.h"
 #include "se050/SE050.h"
+#include "se050/VaultKeys.h"
 #include <Wire.h>
 #include "board_pins.h"
 #include "node_config.h"
@@ -133,8 +134,25 @@ static bool reticulumSetup()
         reticulum.remote_management_enabled(true);
         reticulum.start();
 
-        // Application identity: software keys on LittleFS until phase 3 moves them into the SE050.
-        if (RNS::Utilities::OS::file_exists(NODE_IDENTITY_PATH))
+        // Application identity. With an SE050 on the board both private halves live in the
+        // chip: X25519 (objId MTID) for decrypt, Ed25519 (objId RNSS) for announces, link
+        // proofs and packet proofs. Nothing about it touches LittleFS - the identity is
+        // rebuilt from the chip's public keys on every boot, and the hash is the same as
+        // long as the chip is. Without a chip, the software identity on LittleFS as before.
+        if (se050) {
+            uint8_t exchangePublic[32], signingPublic[32];
+            if (se050->identityEnsure(exchangePublic) && se050->signingEnsure(signingPublic)) {
+                RNS::Identity vault(false);
+                if (vault.load_private_keys(std::make_shared<Se050ExchangeKey>(*se050, exchangePublic),
+                                            std::make_shared<Se050SigningKey>(*se050, signingPublic))) {
+                    node_identity = vault;
+                    Serial.println("[node] application identity keys live in the SE050");
+                }
+            }
+            if (!node_identity)
+                Serial.println("[node] SE050 present but its keys are not usable, falling back to LittleFS");
+        }
+        if (!node_identity && RNS::Utilities::OS::file_exists(NODE_IDENTITY_PATH))
             node_identity = RNS::Identity::from_file(NODE_IDENTITY_PATH);
         if (!node_identity) {
             Serial.println("[node] creating application identity");
