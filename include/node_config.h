@@ -11,8 +11,14 @@
 #define NODE_ANNOUNCE_INTERVAL_S 120
 #define NODE_ANNOUNCE_APP_DATA "rp2350_reticulum_eth_node"
 
-// Where the application identity lives on LittleFS (phase 3 replaces the bytes with SE050 handles).
+// Where the application identity lives on LittleFS when there is no SE050 (with one, both
+// identities are rebuilt from the chip's public keys and this file is not used).
 #define NODE_IDENTITY_PATH "/node_identity"
+
+// Identity hashes allowed to use remote management (`rnstatus -R <transport identity> -i <file>`,
+// `rnpath -R ...`): status and path table over a Link, no USB needed. Empty list = nobody.
+// Currently the management identity kept on the Pine64 in ~/mgmt_identity.
+#define NODE_REMOTE_MANAGEMENT_ALLOWED {"3cf4282341f8fe4934f7b416b8287992"}
 
 // LoRa air parameters — must match on every node of the mesh (both benches run this file).
 // 869.525 MHz sits in the EU g3 sub-band (869.4–869.65, 10 % duty cycle). SF8/125 kHz/4:5 is the

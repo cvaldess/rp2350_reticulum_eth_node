@@ -20,6 +20,8 @@
 #include "board_pins.h"
 #include "node_config.h"
 
+#include <set>
+
 static RNS::Reticulum reticulum({RNS::Type::NONE});
 static RNS::Interface tcp_interface({RNS::Type::NONE});
 static RNS::Interface lora_interface({RNS::Type::NONE});
@@ -140,6 +142,20 @@ static bool reticulumSetup()
             } else {
                 Serial.println("[node] SE050 present but transport keys are not usable, Transport falls back to LittleFS");
             }
+        }
+
+        // Who may talk to rnstransport.remote.management. Transport::start() copies the
+        // list into the request handlers, so it has to be complete before start().
+        {
+            std::set<RNS::Bytes> allowed;
+            for (const char *hex : NODE_REMOTE_MANAGEMENT_ALLOWED) {
+                RNS::Bytes hash;
+                hash.assignHex(hex);
+                allowed.insert(hash);
+            }
+            RNS::Transport::remote_management_allowed(allowed);
+            Serial.printf("[node] remote management allowed for %u identit%s\n", (unsigned)allowed.size(),
+                          allowed.size() == 1 ? "y" : "ies");
         }
 
         reticulum.transport_enabled(true);
