@@ -6,3 +6,8 @@
 .DS_Store
 Thumbs.db
 bench/logs/
+
+# NXP Plug&Trust MW (114 MB, not ours to redistribute)
+se05x_mw_v04.08.01.zip
+se05x_mw/
+simw-top/

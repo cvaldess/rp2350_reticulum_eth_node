@@ -43,10 +43,19 @@ From the public NXP Plug&Trust headers and AN12436/AN12543:
 | success response | `KVN ‖ KCV_enc ‖ KCV_mac ‖ KCV_dek` (10 B) | same (memcmp verify-after-send) |
 
 The framing was confirmed against NXP's own rotation demo
-`se05x_RotatePlatformSCP03Keys/se05x_TP_PlatformSCP03keys.c` (public on GitHub, no
-registration): two length bytes per key (`0x11` = keyLen+1, then `0x10` = keyLen), which is
-the one thing the earlier draft had wrong (it omitted the first). `tools/scp03_rotate.py plan`
-now emits 70 bytes and the expected response to compare after the send.
+`se05x_RotatePlatformSCP03Keys/se05x_TP_PlatformSCP03keys.c` (`createKeyData`): two length
+bytes per key (`0x11` = keyLen+1, then `0x10` = keyLen), which is the one thing the earlier
+draft had wrong (it omitted the first). `tools/scp03_rotate.py plan` now emits 70 bytes and the
+expected response to compare after the send.
+
+Verified twice: first against a public GitHub mirror, then against the official package
+`se05x_mw_v04.08.01` (Plug&Trust MW, NXP account). The demo source is byte-identical between
+the two, and every constant matches from the official headers: `GP_CLA_BYTE 0x80`,
+`GP_INS_PUTKEY 0xD8`, `GP_P2_MULTIPLEKEYS 0x81`, `GPCS_KEY_TYPE_AES 0x88`,
+`CRYPTO_KEY_CHECK_LEN 3`, `SCP03_KEY_ID 0x01`, `EX_SSS_AUTH_SE05X_KEY_VERSION_NO 0x0B`. The
+official file also notes the SE050 authenticates PlatformSCP with KVN 11 (`0x0B`), which is the
+version this rotation replaces (P1) and keeps. The zip and any extraction are gitignored; NXP
+source is not redistributed in this repo.
 
 ## Validated offline (non-destructive)
 
