@@ -5,6 +5,14 @@
 #define RNS_TCP_TARGET_HOST "192.168.1.187"
 #define RNS_TCP_TARGET_PORT 4242
 
+// Clock. microReticulum keeps time as millis() plus a persisted offset, so without this the
+// node lives in 1970 and every timestamp it reports (path expiry, announces) is nonsense.
+// The name goes through the DHCP-supplied DNS; the fallback is time.cloudflare.com (anycast).
+#define NODE_NTP_SERVER "pool.ntp.org"
+#define NODE_NTP_FALLBACK_IP "162.159.200.1"
+#define NODE_NTP_INTERVAL_S (6 * 3600)
+#define NODE_NTP_RETRY_S 60
+
 // Reticulum destination this node announces so the host can see it exists.
 #define NODE_APP_NAME "rp2350node"
 #define NODE_APP_ASPECT "status"

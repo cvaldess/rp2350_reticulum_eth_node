@@ -11,6 +11,7 @@
 
 #include "EthernetLink.h"
 #include "LoRaInterface.h"
+#include "Ntp.h"
 #include "PicoLittleFSFileSystem.h"
 #include "Rp2350Trng.h"
 #include "TCPClientInterface.h"
@@ -35,6 +36,10 @@ static LoRaInterface *lora = nullptr;
 
 static uint32_t lastAnnounce = 0;
 static bool announcePending = false;
+
+static Ntp ntp(NODE_NTP_SERVER, NODE_NTP_FALLBACK_IP);
+static uint32_t lastClockSync = 0; // millis() of the last request, answered or not
+static bool clockValid = false;
 
 // microReticulum's log sink writes through newlib's _write().
 extern "C" int _write(int file, char *ptr, int len)
@@ -69,6 +74,38 @@ static void se050Setup()
         delete se050;
         se050 = nullptr;
     }
+}
+
+// Puts Reticulum's clock on Unix time. OS::ltime() is millis() plus an offset that the
+// library persists to flash every 10 minutes, so the offset becomes "Unix ms minus
+// millis()". Applied after reticulum.start(), which loads its own offset first; from
+// then on the persisted offset is already epoch-based and later boots start close.
+static void clockApply(uint64_t unixMs, const char *why)
+{
+    int64_t delta = (int64_t)unixMs - (int64_t)RNS::Utilities::OS::ltime();
+    if (delta > 1000 || delta < -1000)
+        RNS::Utilities::OS::setTimeOffset(RNS::Utilities::OS::getTimeOffset() + delta);
+    clockValid = true;
+    char when[24];
+    Ntp::format(unixMs, when, sizeof(when));
+    Serial.printf("[clock] %s: %s (step %+lld ms)\n", why, when, (long long)delta);
+}
+
+// One request in flight at most; a reply is applied whenever it lands. Re-syncs every
+// NODE_NTP_INTERVAL_S, or every NODE_NTP_RETRY_S while the clock has never been set.
+static void clockLoop()
+{
+    uint64_t unixMs;
+    if (ntp.poll(unixMs))
+        clockApply(unixMs, "ntp");
+    if (ntp.pending() || !eth.hasIp())
+        return;
+    uint32_t interval = (clockValid ? NODE_NTP_INTERVAL_S : NODE_NTP_RETRY_S) * 1000u;
+    if (lastClockSync != 0 && millis() - lastClockSync < interval)
+        return;
+    lastClockSync = millis();
+    if (!ntp.request())
+        Serial.println("[clock] NTP request not sent (no DNS answer / no socket)");
 }
 
 static void printHeap(const char *tag)
@@ -163,6 +200,23 @@ static bool reticulumSetup()
         reticulum.remote_management_enabled(true);
         reticulum.start();
 
+        // Clock, right after start() so no Transport state is timestamped in the old
+        // timebase. Blocking here (at most REPLY_TIMEOUT_MS) is fine, the loop is not
+        // running yet; afterwards clockLoop() keeps it in step without blocking.
+        if (eth.hasIp() && ntp.request()) {
+            lastClockSync = millis();
+            uint64_t unixMs = 0;
+            while (ntp.pending()) {
+                if (ntp.poll(unixMs)) {
+                    clockApply(unixMs, "boot");
+                    break;
+                }
+                delay(5);
+            }
+            if (!clockValid)
+                Serial.println("[clock] no NTP answer at boot, will keep trying");
+        }
+
         // Application identity. With an SE050 on the board both private halves live in the
         // chip: X25519 (objId MTID) for decrypt, Ed25519 (objId RNSS) for announces, link
         // proofs and packet proofs. Nothing about it touches LittleFS - the identity is
@@ -206,6 +260,13 @@ static void handleConsole()
             Serial.flush();
             rp2040.reboot();
             break;
+        case 't': {
+            char when[24];
+            Ntp::format(RNS::Utilities::OS::ltime(), when, sizeof(when));
+            Serial.printf("[clock] now %s (%s), requesting a sync\n", when, clockValid ? "synced" : "never synced");
+            lastClockSync = 0; // clockLoop() sends on its next pass
+            break;
+        }
         case 'i':
             Serial.printf("transport identity: %s\n", RNS::Transport::identity().hexhash().c_str());
             if (node_destination)
@@ -308,6 +369,7 @@ void loop()
     eth.loop();
     reticulum.loop();
     handleConsole();
+    clockLoop();
 
     // First announce a few seconds after the node is reachable (TCP link up, or LoRa alone on a
     // LoRa-only build), then every NODE_ANNOUNCE_INTERVAL_S.
