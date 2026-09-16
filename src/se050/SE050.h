@@ -81,6 +81,22 @@ class SE050
     // little-endian; the SE050 works big-endian, so both are reversed here.
     bool identityEcdh(const uint8_t peerPublic[32], uint8_t shared[32]);
 
+    // Ensures this node has an Ed25519 signing key inside the SE050 (curve
+    // ID_ECC_ED_25519), generated in the chip on first use and reused afterwards;
+    // the seed never leaves it. Returns the public key in RFC 8032 order (the chip
+    // reports it reversed, AN12413 section 7.1). Requires an open secure channel.
+    bool signingEnsure(uint8_t publicKey[32]);
+
+    // Longest message sign() accepts. secureApdu's Lc is a short-form byte, which
+    // caps its C-DATA at 239 bytes; the session wrapper takes 20 of those and the
+    // EdDSASign TLVs 12 more, so 207 is the ceiling and 200 keeps a margin.
+    static constexpr size_t SIGN_MAX_MESSAGE = 200;
+
+    // EdDSA pure (RFC 8032) over message with the on-chip signing key. The chip
+    // hashes the plain message itself. Signature is r||s in RFC order; the chip
+    // returns each half reversed and they are put right here.
+    bool sign(const uint8_t *message, size_t len, uint8_t signature[64]);
+
     // Bring-up check for all four layers.
     bool probe();
 
@@ -173,6 +189,7 @@ class SE050
     // Which key object identityEcdh works against: the chip-generated identity or
     // the mirrored node key, depending on which path prepared it.
     uint32_t activeKeyObj = 0;
+    bool signingReady = false;
 };
 
 // The instance the boot probe left behind, or null if this board has no SE050 or

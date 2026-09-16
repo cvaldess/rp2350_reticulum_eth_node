@@ -9,6 +9,7 @@
 #include <AES.h>
 #include <Arduino.h>
 #include <Curve25519.h>
+#include <Ed25519.h>
 #include <string.h>
 
 SE050 *se050 = nullptr;
@@ -386,6 +387,12 @@ bool SE050::initializeUpdate(const uint8_t hostChallenge[8], uint8_t cardChallen
 bool SE050::openSecureChannel()
 {
     memset(&scp, 0, sizeof(scp));
+    // A new channel means the UserID session nested in the old one is gone too;
+    // the chip was reset to get here. Leaving the flag set made a re-probe try
+    // ReadObject inside a dead session, fail, and then "generate" over an
+    // identity that already exists (WriteECKey 6985).
+    sessionActive = false;
+    identityReady = signingReady = false;
 
     uint8_t hostChallenge[8];
     if (!se050PortRandom(hostChallenge, sizeof(hostChallenge))) {
@@ -695,6 +702,7 @@ void SE050::reverse(const uint8_t *in, uint8_t *out, size_t len)
 namespace
 {
 constexpr uint32_t IDENTITY_OBJ = 0x4D544944u; // "MTID", the node's X25519 identity
+constexpr uint32_t SIGNING_OBJ = 0x524E5353u;  // "RNSS", the node's Ed25519 signing key
 // "MTKY", the mirrored copy of the key Meshtastic already holds in its config.
 // Deliberately a different object from MTID so the chip-generated identity, and
 // the self-test that leans on it, stay intact.
@@ -733,15 +741,16 @@ bool SE050::identitySession()
     int rl, vl;
     const uint8_t *v;
 
-    // Applet 7.x does not ship the Montgomery curve pre-created, and key agreement
-    // against an external public key by byte-array is the one path that needs it.
-    // Idempotent: 6985 just means it already exists.
-    {
+    // Applet 7.x does not ship the Montgomery or the Edwards curve pre-created; the
+    // X25519 identity needs the first, the Ed25519 signing key the second. Neither
+    // takes curve parameters (AN12413 4.8.2). Idempotent: 6985 just means it exists.
+    static const uint8_t CURVES[] = {0x41, 0x40}; // ID_ECC_MONT_DH_25519, ID_ECC_ED_25519
+    for (uint8_t curve : CURVES) {
         const uint8_t h[4] = {0x80, 0x01, 0x0B, 0x04};
-        uint8_t d[] = {0x41, 0x01, 0x41};
+        uint8_t d[] = {0x41, 0x01, curve};
         secureApdu(h, d, sizeof(d), false, r, sizeof(r), &sw);
         if (sw != 0x9000 && sw != 0x6985)
-            LOG_WARN("SE050: CreateECCurve SW=%04x", sw);
+            LOG_WARN("SE050: CreateECCurve %02x SW=%04x", curve, sw);
     }
 
     // UserID authenticator. INS carries the AUTH_OBJECT bit (0x40). Also idempotent.
@@ -999,6 +1008,105 @@ bool SE050::identityEcdh(const uint8_t peerPublic[32], uint8_t shared[32])
     return true;
 }
 
+bool SE050::signingEnsure(uint8_t publicKey[32])
+{
+    signingReady = false;
+    if (!identitySession())
+        return false;
+
+    uint8_t authId[4], keyId[4];
+    be32(AUTH_OBJ, authId);
+    be32(SIGNING_OBJ, keyId);
+
+    uint8_t r[192];
+    uint16_t sw = 0;
+    int rl, vl;
+    const uint8_t *v;
+
+    // Same shape as identityEnsure: read it, and generate it in the chip the one
+    // time it is not there.
+    const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
+    uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
+    rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
+    if (sw != 0x9000) {
+        LOG_INFO("SE050: no signing key yet, generating Ed25519 in-chip (objId 0x%08x)", (unsigned)SIGNING_OBJ);
+        const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00}; // P1_KEY_PAIR | P1_EC, no TAG_3/4: the chip generates
+        // Policy: bound to the UserID authenticator, allowing sign and verify
+        // (AR header 0x183C0000: ALLOW_SIGN | ALLOW_VERIFY | READ | WRITE | GEN | DELETE).
+        uint8_t dGen[] = {0x11, 0x09, 0x08, authId[0], authId[1], authId[2], authId[3], 0x18, 0x3C, 0x00,
+                          0x00, 0x41, 0x04, keyId[0],  keyId[1],  keyId[2],  keyId[3],  0x42, 0x01, 0x40};
+        sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
+        if (sw != 0x9000) {
+            LOG_ERROR("SE050: WriteECKey (Ed25519) SW=%04x", sw);
+            return false;
+        }
+        rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
+        if (sw != 0x9000) {
+            LOG_ERROR("SE050: ReadObject (Ed25519) SW=%04x", sw);
+            return false;
+        }
+    } else {
+        LOG_INFO("SE050: reusing existing signing key (objId 0x%08x)", (unsigned)SIGNING_OBJ);
+    }
+    v = tlv1(r, rl, &vl);
+    if (!v || vl != 32) {
+        LOG_ERROR("SE050: unexpected Ed25519 public key length %d", vl);
+        return false;
+    }
+    reverse(v, publicKey, 32); // the SE050 reports it big-endian (AN12413 7.1)
+
+    signingReady = true;
+    return true;
+}
+
+bool SE050::sign(const uint8_t *message, size_t len, uint8_t signature[64])
+{
+    if (!signingReady || reentered("sign"))
+        return false;
+    if (len > SIGN_MAX_MESSAGE) {
+        LOG_ERROR("SE050: message of %u bytes exceeds the %u-byte signing limit", (unsigned)len, (unsigned)SIGN_MAX_MESSAGE);
+        return false;
+    }
+
+    uint8_t keyId[4];
+    be32(SIGNING_OBJ, keyId);
+
+    const uint8_t h[4] = {0x80, 0x03, 0x0C, 0x09}; // INS_CRYPTO, P1_SIGNATURE, P2_SIGN
+    uint8_t d[12 + SIGN_MAX_MESSAGE];
+    int j = 0;
+    d[j++] = 0x41; // TAG_1: the on-chip signing key
+    d[j++] = 0x04;
+    memcpy(&d[j], keyId, 4);
+    j += 4;
+    d[j++] = 0x42; // TAG_2: EDSignatureAlgo
+    d[j++] = 0x01;
+    d[j++] = 0xA3; // SIG_ED25519PURE, the chip runs SHA-512 over the plain message
+    d[j++] = 0x43; // TAG_3: the message, BER length
+    if (len > 0x7F)
+        d[j++] = 0x81;
+    d[j++] = (uint8_t)len;
+    memcpy(&d[j], message, len);
+    j += len;
+
+    uint8_t r[96];
+    uint16_t sw = 0;
+    int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
+    if (sw != 0x9000) {
+        LOG_ERROR("SE050: EdDSASign SW=%04x", sw);
+        return false;
+    }
+    int vl;
+    const uint8_t *v = tlv1(r, rl, &vl);
+    if (!v || vl != 64) {
+        LOG_ERROR("SE050: unexpected signature length %d", vl);
+        return false;
+    }
+    // r and s come back reversed, each on its own (AN12413 7.1, figure 19).
+    reverse(v, signature, 32);
+    reverse(v + 32, signature + 32, 32);
+    return true;
+}
+
 bool SE050::probe()
 {
     if (!open()) {
@@ -1026,8 +1134,8 @@ bool SE050::probe()
         vi = &r[off];
         if (n - off >= 7) {
             uint16_t cfg = (uint16_t)((vi[3] << 8) | vi[4]);
-            LOG_INFO("SE050: applet %d.%d.%d AppletConfig=0x%04x (DH_MONT %s, FIPS %s)", vi[0], vi[1], vi[2], cfg,
-                     (cfg & 0x0008) ? "on" : "off", (cfg & 0x1000) ? "off" : "on");
+            LOG_INFO("SE050: applet %d.%d.%d AppletConfig=0x%04x (EDDSA %s, DH_MONT %s, FIPS %s)", vi[0], vi[1], vi[2],
+                     cfg, (cfg & 0x0004) ? "on" : "off", (cfg & 0x0008) ? "on" : "off", (cfg & 0x1000) ? "off" : "on");
         }
     } else {
         LOG_WARN("SE050: GetVersion returned SW=%04x", statusWord(r, n));
@@ -1142,6 +1250,48 @@ bool SE050::probe()
         LOG_INFO("SE050: ECDH cost over %d rounds: min %u ms, avg %u ms, max %u ms | software %u ms (%ux)", done, best / 1000,
                  (total / done) / 1000, worst / 1000, softUs / 1000, softUs ? (total / done) / softUs : 0);
 #endif
+
+    // Same equivalence check for the signing key: sign in the chip, verify with the
+    // Ed25519 implementation microReticulum uses. A fresh message every boot, so a
+    // signature cached anywhere could not pass. The one thing this cannot catch is
+    // a key that signs consistently but was not generated where we think - that
+    // is what the policy and the never-exported seed are for.
+    uint8_t sigPublic[32];
+    if (!signingEnsure(sigPublic)) {
+        LOG_WARN("SE050: signing key not available");
+        return true;
+    }
+    for (int i = 0; i < 32; i++)
+        snprintf(&hex[i * 2], 3, "%02X", sigPublic[i]);
+    LOG_INFO("SE050: signing public key %s", hex);
+
+    uint8_t msg[48];
+    memcpy(msg, "rp2350_reticulum_eth_node se050 ", 32);
+    se050PortRandom(&msg[32], 16);
+    uint8_t sig[64];
+    uint32_t signT0 = micros();
+    if (!sign(msg, sizeof(msg), sig)) {
+        LOG_WARN("SE050: EdDSA sign failed, cannot compare against software");
+        return true;
+    }
+    uint32_t signUs = micros() - signT0;
+    if (Ed25519::verify(sig, sigPublic, msg, sizeof(msg))) {
+        LOG_INFO("SE050: EdDSA signature verifies in software - hardware Ed25519 is usable (%u ms per sign)", signUs / 1000);
+    } else {
+        // Bring-up diagnostic: say which byte order would have verified, if any, so
+        // one flash settles it instead of a guess per boot.
+        uint8_t altPub[32], altSig[64];
+        reverse(sigPublic, altPub, 32);
+        reverse(sig, altSig, 32);
+        reverse(sig + 32, altSig + 32, 32);
+        bool pubRev = Ed25519::verify(sig, altPub, msg, sizeof(msg));
+        bool halvesRev = Ed25519::verify(altSig, sigPublic, msg, sizeof(msg));
+        bool bothRev = Ed25519::verify(altSig, altPub, msg, sizeof(msg));
+        reverse(sig, altSig, 64);
+        bool wholeRev = Ed25519::verify(altSig, sigPublic, msg, sizeof(msg));
+        LOG_ERROR("SE050: EdDSA MISMATCH (pub reversed: %s, sig halves reversed: %s, both: %s, sig whole reversed: %s)",
+                  pubRev ? "ok" : "no", halvesRev ? "ok" : "no", bothRev ? "ok" : "no", wholeRev ? "ok" : "no");
+    }
 
     return true;
 }
