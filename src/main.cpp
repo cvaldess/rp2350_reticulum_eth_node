@@ -1,23 +1,31 @@
-// rp2350_reticulum_eth_node — phase 0: does microReticulum live on the RP2350?
+// rp2350_reticulum_eth_node — phase 1: Reticulum transport node reachable over Ethernet.
 //
-// No interfaces yet. This probe proves the parts every later phase depends on:
-//   - the library builds and links on arduino-pico with exceptions enabled
-//   - LittleFS works through the microStore adapter (src/PicoLittleFSFileSystem.h)
-//   - the Crypto RNG is seeded from the RP2350 TRNG before any key is generated
-//   - Transport creates a transport identity, persists it, and reloads it after a reboot
-// Success criterion: the "transport identity" hash printed at boot is identical after a reset.
+// Phase 0 proved the stack lives on the RP2350 (identity persists, TRNG-seeded RNG).
+// Phase 1 adds the W5500 and a TCPClientInterface to an rnsd on the LAN, plus an
+// application destination that is announced periodically so the host can see this node.
 
 #include <Arduino.h>
 #include <microReticulum.h>
 #include <microStore/FileSystem.h>
 
+#include "EthernetLink.h"
 #include "PicoLittleFSFileSystem.h"
 #include "Rp2350Trng.h"
+#include "TCPClientInterface.h"
 #include "board_pins.h"
+#include "node_config.h"
 
 static RNS::Reticulum reticulum({RNS::Type::NONE});
+static RNS::Interface tcp_interface({RNS::Type::NONE});
+static RNS::Identity node_identity({RNS::Type::NONE});
+static RNS::Destination node_destination({RNS::Type::NONE});
 static microStore::Adapters::PicoLittleFSFileSystem filesystem;
 static Rp2350Trng trng;
+static EthernetLink eth;
+static TCPClientInterface *tcp = nullptr;
+
+static uint32_t lastAnnounce = 0;
+static bool announcePending = false;
 
 // microReticulum's log sink writes through newlib's _write().
 extern "C" int _write(int file, char *ptr, int len)
@@ -31,6 +39,27 @@ extern "C" int _write(int file, char *ptr, int len)
 static void printHeap(const char *tag)
 {
     Serial.printf("[%s] heap total=%d free=%d\n", tag, rp2040.getTotalHeap(), rp2040.getFreeHeap());
+}
+
+static IPAddress parseIp(const char *s)
+{
+    IPAddress ip;
+    ip.fromString(s);
+    return ip;
+}
+
+static void announceNow(const char *why)
+{
+    if (!node_destination)
+        return;
+    try {
+        node_destination.announce(RNS::bytesFromString(NODE_ANNOUNCE_APP_DATA));
+        lastAnnounce = millis();
+        announcePending = false;
+        Serial.printf("[node] announced %s (%s)\n", node_destination.hash().toHex().c_str(), why);
+    } catch (const std::exception &e) {
+        Serial.printf("[node] announce failed: %s\n", e.what());
+    }
 }
 
 static bool reticulumSetup()
@@ -48,41 +77,37 @@ static bool reticulumSetup()
             return false;
         }
 
+        tcp = new TCPClientInterface("TCPClientInterface", parseIp(RNS_TCP_TARGET_HOST), RNS_TCP_TARGET_PORT);
+        tcp_interface = tcp;
+        tcp_interface.mode(RNS::Type::Interface::MODE_FULL);
+        RNS::Transport::register_interface(tcp_interface);
+        tcp_interface.start();
+
         reticulum.transport_enabled(true);
         reticulum.probe_destination_enabled(true);
         reticulum.remote_management_enabled(true);
         reticulum.start();
+
+        // Application identity: software keys on LittleFS until phase 3 moves them into the SE050.
+        if (RNS::Utilities::OS::file_exists(NODE_IDENTITY_PATH))
+            node_identity = RNS::Identity::from_file(NODE_IDENTITY_PATH);
+        if (!node_identity) {
+            Serial.println("[node] creating application identity");
+            node_identity = RNS::Identity();
+            node_identity.to_file(NODE_IDENTITY_PATH);
+        }
+        node_destination = RNS::Destination(node_identity, RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE,
+                                            NODE_APP_NAME, NODE_APP_ASPECT);
+        // Prove every packet addressed to us so `rnprobe <destination>` from a host round-trips
+        // through this node's signing key: the cheapest end-to-end check of the whole stack.
+        node_destination.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
+        Serial.printf("[node] identity %s destination %s\n", node_identity.hexhash().c_str(),
+                      node_destination.hash().toHex().c_str());
         return true;
     } catch (const std::exception &e) {
         Serial.printf("FATAL: exception during Reticulum setup: %s\n", e.what());
         return false;
     }
-}
-
-void setup()
-{
-    pinMode(LED_PIN, OUTPUT);
-    Serial.begin(115200);
-    // Headless node: wait a little for the USB console, then carry on regardless.
-    for (uint32_t t0 = millis(); !Serial && millis() - t0 < 3000;)
-        delay(50);
-
-    Serial.println();
-    Serial.println("rp2350_reticulum_eth_node phase 0 probe");
-    printHeap("boot");
-
-    RNS::loglevel(RNS::LOG_DEBUG);
-
-    if (!reticulumSetup()) {
-        // Blink fast forever: something below Reticulum is broken.
-        for (;;) {
-            digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-            delay(100);
-        }
-    }
-
-    Serial.printf("transport identity: %s\n", RNS::Transport::identity().hexhash().c_str());
-    printHeap("after start");
 }
 
 // USB console: the only thing USB carries besides flashing.
@@ -97,9 +122,20 @@ static void handleConsole()
             break;
         case 'i':
             Serial.printf("transport identity: %s\n", RNS::Transport::identity().hexhash().c_str());
+            if (node_destination)
+                Serial.printf("node destination:   %s\n", node_destination.hash().toHex().c_str());
             break;
         case 'h':
             printHeap("console");
+            break;
+        case 'e':
+            eth.report();
+            if (tcp)
+                Serial.printf("[tcp] %s reconnects=%lu\n", tcp->connected() ? "connected" : "disconnected",
+                              (unsigned long)tcp->reconnects());
+            break;
+        case 'a':
+            announceNow("console");
             break;
         case 'f': {
             fs::FSInfo info;
@@ -119,10 +155,54 @@ static void handleConsole()
     }
 }
 
+void setup()
+{
+    pinMode(LED_PIN, OUTPUT);
+    Serial.begin(115200);
+    // Headless node: wait a little for the USB console, then carry on regardless.
+    for (uint32_t t0 = millis(); !Serial && millis() - t0 < 3000;)
+        delay(50);
+
+    Serial.println();
+    Serial.println("rp2350_reticulum_eth_node phase 1");
+    printHeap("boot");
+
+    eth.begin();
+
+    RNS::loglevel(RNS::LOG_DEBUG);
+
+    if (!reticulumSetup()) {
+        // Blink fast forever: something below Reticulum is broken.
+        for (;;) {
+            digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+            delay(100);
+        }
+    }
+
+    Serial.printf("transport identity: %s\n", RNS::Transport::identity().hexhash().c_str());
+    printHeap("after start");
+    announcePending = true;
+}
+
 void loop()
 {
+    eth.loop();
     reticulum.loop();
     handleConsole();
+
+    // First announce a few seconds after the TCP link comes up, then every NODE_ANNOUNCE_INTERVAL_S.
+    static uint32_t onlineSince = 0;
+    bool online = tcp && tcp->connected();
+    if (!online) {
+        onlineSince = 0;
+    } else if (onlineSince == 0) {
+        onlineSince = millis();
+        announcePending = true;
+    } else if (announcePending && millis() - onlineSince >= 5000) {
+        announceNow("link up");
+    } else if (millis() - lastAnnounce >= (uint32_t)NODE_ANNOUNCE_INTERVAL_S * 1000) {
+        announceNow("periodic");
+    }
 
     static uint32_t lastReport = 0;
     if (millis() - lastReport >= 10000) {
