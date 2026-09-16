@@ -791,9 +791,64 @@ bool SE050::identitySession()
     return true;
 }
 
-bool SE050::x25519Ensure(uint32_t objId, uint8_t publicKey[32])
+// --- Recovery ------------------------------------------------------------
+//
+// Three things can leave the host and the chip disagreeing: the chip resets behind
+// our back (brown-out, ENA toggled) and forgets the SCP03 state and the session; the
+// channel gets closed by secureApdu() on an error it recognises; the counter drifts.
+// Every operation below funnels through ensureSession() and, if the chip still does
+// not answer 9000 with a live session, rebuilds everything once and retries once.
+// The rest of the node sees a slower call, not a dead vault until the next reboot.
+
+bool SE050::recover(const char *what)
 {
-    if (!identitySession())
+    LOG_WARN("SE050: %s found the channel down, rebuilding applet select, SCP03 and the session", what);
+    scp.open = sessionActive = false;
+    if (!open()) {
+        LOG_ERROR("SE050: chip does not answer the interface reset");
+        return false;
+    }
+    if (!openSecureChannel()) {
+        LOG_ERROR("SE050: secure channel could not be reopened");
+        return false;
+    }
+    return identitySession();
+}
+
+bool SE050::ensureSession(const char *what)
+{
+    if (sessionActive)
+        return true;
+    if (scp.open)
+        return identitySession(); // fresh channel, first session: the ordinary path
+    return recover(what);
+}
+
+int SE050::objectExists(uint32_t objId)
+{
+    uint8_t keyId[4];
+    be32(objId, keyId);
+    const uint8_t h[4] = {0x80, 0x04, 0x00, 0x27}; // INS_MGMT, P1_DEFAULT, P2_EXIST
+    uint8_t d[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
+    uint8_t r[32];
+    uint16_t sw = 0;
+    int rl = sessionApdu(h, d, sizeof(d), true, r, sizeof(r), &sw);
+    if (sw != 0x9000) {
+        LOG_WARN("SE050: CheckObjectExists SW=%04x", sw);
+        return -1;
+    }
+    int vl;
+    const uint8_t *v = tlv1(r, rl, &vl);
+    if (!v || vl != 1)
+        return -1;
+    return v[0] == 0x01 ? 1 : 0; // RESULT_SUCCESS / RESULT_FAILURE
+}
+
+// --- Keys by object id ---------------------------------------------------
+
+bool SE050::keyEnsure(const char *what, uint32_t objId, uint8_t curve, const uint8_t policy[4], uint8_t publicKey[32])
+{
+    if (reentered("keyEnsure"))
         return false;
 
     uint8_t authId[4], keyId[4];
@@ -805,43 +860,68 @@ bool SE050::x25519Ensure(uint32_t objId, uint8_t publicKey[32])
     int rl, vl;
     const uint8_t *v;
 
-    // Read the key; if it is not there, generate it. Generation is persistent,
-    // so this only ever happens once per object.
-    const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
-    uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
-    rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
-    if (sw != 0x9000) {
-        LOG_INFO("SE050: no X25519 key at 0x%08x yet, generating it in-chip", (unsigned)objId);
-        const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00}; // P1_KEY_PAIR | P1_EC, no TAG_3/4: the chip generates
-        // Policy: bound to the UserID authenticator, allowing key agreement
-        // (AR header 0x043C0000: ALLOW_KA | READ | WRITE | GEN | DELETE).
-        uint8_t dGen[] = {0x11, 0x09, 0x08, authId[0], authId[1], authId[2], authId[3], 0x04, 0x3C, 0x00,
-                          0x00, 0x41, 0x04, keyId[0],  keyId[1],  keyId[2],  keyId[3],  0x42, 0x01, 0x41};
-        sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
-        if (sw != 0x9000) {
-            LOG_ERROR("SE050: WriteECKey (X25519 0x%08x) SW=%04x", (unsigned)objId, sw);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!ensureSession(what))
             return false;
+
+        // Ask before reading: a failed ReadObject cannot tell a missing object from a
+        // dead session, and generating over an existing key is the one thing not to do.
+        int exists = objectExists(objId);
+        if (exists < 0) {
+            scp.open = sessionActive = false; // rebuild on the next lap
+            continue;
         }
+        if (exists == 0) {
+            LOG_INFO("SE050: no %s key at 0x%08x yet, generating it in-chip", what, (unsigned)objId);
+            const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00}; // P1_KEY_PAIR | P1_EC, no TAG_3/4: the chip generates
+            // Policy: bound to the UserID authenticator, access rules per curve (see callers).
+            uint8_t dGen[] = {0x11,      0x09,      0x08,      authId[0], authId[1], authId[2], authId[3],
+                              policy[0], policy[1], policy[2], policy[3], 0x41,      0x04,      keyId[0],
+                              keyId[1],  keyId[2],  keyId[3],  0x42,      0x01,      curve};
+            sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
+            if (sw != 0x9000) {
+                LOG_ERROR("SE050: WriteECKey (%s 0x%08x) SW=%04x", what, (unsigned)objId, sw);
+                return false;
+            }
+        } else {
+            LOG_INFO("SE050: reusing %s key at 0x%08x", what, (unsigned)objId);
+        }
+
+        const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
+        uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
         rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
         if (sw != 0x9000) {
-            LOG_ERROR("SE050: ReadObject (X25519 0x%08x) SW=%04x", (unsigned)objId, sw);
+            LOG_ERROR("SE050: ReadObject (%s 0x%08x) SW=%04x", what, (unsigned)objId, sw);
             return false;
         }
-    } else {
-        LOG_INFO("SE050: reusing X25519 key at 0x%08x", (unsigned)objId);
+        v = tlv1(r, rl, &vl);
+        if (!v || vl < 32) {
+            LOG_ERROR("SE050: unexpected %s public key length %d", what, vl);
+            return false;
+        }
+        reverse(v, publicKey, 32); // the SE050 reports big-endian (AN12413 section 7)
+        return true;
     }
-    v = tlv1(r, rl, &vl);
-    if (!v || vl < 32) {
-        LOG_ERROR("SE050: unexpected public key length %d", vl);
-        return false;
-    }
-    reverse(v, publicKey, 32); // the SE050 reports big-endian
-    return true;
+    return false;
+}
+
+bool SE050::x25519Ensure(uint32_t objId, uint8_t publicKey[32])
+{
+    // AR header 0x043C0000: ALLOW_KA | READ | WRITE | GEN | DELETE.
+    static const uint8_t POLICY[4] = {0x04, 0x3C, 0x00, 0x00};
+    return keyEnsure("X25519", objId, 0x41, POLICY, publicKey); // ID_ECC_MONT_DH_25519
+}
+
+bool SE050::ed25519Ensure(uint32_t objId, uint8_t publicKey[32])
+{
+    // AR header 0x183C0000: ALLOW_SIGN | ALLOW_VERIFY | READ | WRITE | GEN | DELETE.
+    static const uint8_t POLICY[4] = {0x18, 0x3C, 0x00, 0x00};
+    return keyEnsure("Ed25519", objId, 0x40, POLICY, publicKey); // ID_ECC_ED_25519
 }
 
 bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32])
 {
-    if (!sessionActive || reentered("x25519Ecdh"))
+    if (reentered("x25519Ecdh"))
         return false;
 
     uint8_t keyId[4];
@@ -863,70 +943,30 @@ bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t sha
 
     uint8_t r[128];
     uint16_t sw = 0;
-    int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
-    if (sw != 0x9000) {
-        LOG_ERROR("SE050: ECDH (0x%08x) SW=%04x", (unsigned)objId, sw);
-        return false;
-    }
-    int vl;
-    const uint8_t *v = tlv1(r, rl, &vl);
-    if (!v || vl != 32)
-        return false;
-    reverse(v, shared, 32);
-    return true;
-}
-
-bool SE050::ed25519Ensure(uint32_t objId, uint8_t publicKey[32])
-{
-    if (!identitySession())
-        return false;
-
-    uint8_t authId[4], keyId[4];
-    be32(AUTH_OBJ, authId);
-    be32(objId, keyId);
-
-    uint8_t r[192];
-    uint16_t sw = 0;
-    int rl, vl;
-    const uint8_t *v;
-
-    // Same shape as x25519Ensure: read it, and generate it in the chip the one
-    // time it is not there.
-    const uint8_t hRead[4] = {0x80, 0x02, 0x00, 0x00};
-    uint8_t dRead[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
-    rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
-    if (sw != 0x9000) {
-        LOG_INFO("SE050: no Ed25519 key at 0x%08x yet, generating it in-chip", (unsigned)objId);
-        const uint8_t hGen[4] = {0x80, 0x01, 0x61, 0x00}; // P1_KEY_PAIR | P1_EC, no TAG_3/4: the chip generates
-        // Policy: bound to the UserID authenticator, allowing sign and verify
-        // (AR header 0x183C0000: ALLOW_SIGN | ALLOW_VERIFY | READ | WRITE | GEN | DELETE).
-        uint8_t dGen[] = {0x11, 0x09, 0x08, authId[0], authId[1], authId[2], authId[3], 0x18, 0x3C, 0x00,
-                          0x00, 0x41, 0x04, keyId[0],  keyId[1],  keyId[2],  keyId[3],  0x42, 0x01, 0x40};
-        sessionApdu(hGen, dGen, sizeof(dGen), false, r, sizeof(r), &sw);
-        if (sw != 0x9000) {
-            LOG_ERROR("SE050: WriteECKey (Ed25519 0x%08x) SW=%04x", (unsigned)objId, sw);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!ensureSession("x25519Ecdh"))
             return false;
+        int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
+        if (sw == 0x9000) {
+            int vl;
+            const uint8_t *v = tlv1(r, rl, &vl);
+            if (!v || vl != 32)
+                return false;
+            reverse(v, shared, 32);
+            return true;
         }
-        rl = sessionApdu(hRead, dRead, sizeof(dRead), true, r, sizeof(r), &sw);
-        if (sw != 0x9000) {
-            LOG_ERROR("SE050: ReadObject (Ed25519 0x%08x) SW=%04x", (unsigned)objId, sw);
-            return false;
-        }
-    } else {
-        LOG_INFO("SE050: reusing Ed25519 key at 0x%08x", (unsigned)objId);
+        // A live session with an existing key and this policy cannot refuse a key
+        // agreement, so whatever came back means the chip and the host no longer
+        // share a session or a channel: rebuild once and retry once.
+        LOG_WARN("SE050: ECDH (0x%08x) SW=%04x%s", (unsigned)objId, sw, attempt == 0 ? ", rebuilding and retrying" : "");
+        scp.open = sessionActive = false;
     }
-    v = tlv1(r, rl, &vl);
-    if (!v || vl != 32) {
-        LOG_ERROR("SE050: unexpected Ed25519 public key length %d", vl);
-        return false;
-    }
-    reverse(v, publicKey, 32); // the SE050 reports it big-endian (AN12413 7.1)
-    return true;
+    return false;
 }
 
 bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint8_t signature[64])
 {
-    if (!sessionActive || reentered("ed25519Sign"))
+    if (reentered("ed25519Sign"))
         return false;
     if (len > SIGN_MAX_MESSAGE) {
         LOG_ERROR("SE050: message of %u bytes exceeds the %u-byte signing limit", (unsigned)len, (unsigned)SIGN_MAX_MESSAGE);
@@ -955,21 +995,43 @@ bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint
 
     uint8_t r[96];
     uint16_t sw = 0;
-    int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
-    if (sw != 0x9000) {
-        LOG_ERROR("SE050: EdDSASign (0x%08x) SW=%04x", (unsigned)objId, sw);
-        return false;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!ensureSession("ed25519Sign"))
+            return false;
+        int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
+        if (sw == 0x9000) {
+            int vl;
+            const uint8_t *v = tlv1(r, rl, &vl);
+            if (!v || vl != 64) {
+                LOG_ERROR("SE050: unexpected signature length %d", vl);
+                return false;
+            }
+            // r and s come back reversed, each on its own (AN12413 7.1, figure 19).
+            reverse(v, signature, 32);
+            reverse(v + 32, signature + 32, 32);
+            return true;
+        }
+        // Same reasoning as x25519Ecdh: this cannot be a policy refusal.
+        LOG_WARN("SE050: EdDSASign (0x%08x) SW=%04x%s", (unsigned)objId, sw, attempt == 0 ? ", rebuilding and retrying" : "");
+        scp.open = sessionActive = false;
     }
-    int vl;
-    const uint8_t *v = tlv1(r, rl, &vl);
-    if (!v || vl != 64) {
-        LOG_ERROR("SE050: unexpected signature length %d", vl);
-        return false;
+    return false;
+}
+
+void SE050::faultInject(char what)
+{
+    switch (what) {
+    case 'c':
+        scp.counter += 3;
+        LOG_WARN("SE050: fault injected, host SCP03 counter advanced by 3");
+        break;
+    case 's':
+        sessionId[0] ^= 0xFF;
+        LOG_WARN("SE050: fault injected, session id corrupted");
+        break;
+    default:
+        break;
     }
-    // r and s come back reversed, each on its own (AN12413 7.1, figure 19).
-    reverse(v, signature, 32);
-    reverse(v + 32, signature + 32, 32);
-    return true;
 }
 
 // --- The node identity: wrappers the self-test and the Meshtastic port use ----

@@ -221,6 +221,27 @@ static void handleConsole()
             if (se050)
                 Serial.printf("[se050] re-probe %s\n", se050->probe() ? "OK" : "FAILED");
             break;
+        // Fault injection for the vault's recovery path (bench only). Follow any of them
+        // with `a`: the announce signs in the chip and has to come out signed anyway.
+        case 'x': // the chip loses everything: SCP03 state, session, T=1 sequence
+#ifdef SE050_ENA_PIN
+            Serial.println("[se050] fault: power-cycling the chip via ENA");
+            digitalWrite(SE050_ENA_PIN, LOW);
+            delay(5);
+            digitalWrite(SE050_ENA_PIN, HIGH);
+            delay(250);
+#else
+            Serial.println("[se050] no ENA pin on this carrier, cannot power-cycle the chip");
+#endif
+            break;
+        case 'X': // host and chip disagree about the SCP03 counter
+            if (se050)
+                se050->faultInject('c');
+            break;
+        case 'Z': // host names a session the chip does not have
+            if (se050)
+                se050->faultInject('s');
+            break;
         case 'e':
             eth.report();
             if (tcp)

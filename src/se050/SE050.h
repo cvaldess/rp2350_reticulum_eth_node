@@ -123,6 +123,12 @@ class SE050
     // Bring-up check for all four layers.
     bool probe();
 
+    // Bench-only fault injection for the recovery path. 'c' advances the host SCP03
+    // counter so the chip rejects the next C-MAC; 's' corrupts the session id so the
+    // next ProcessSessionCmd names a session the chip does not know. A chip reset
+    // (ENA low/high) is injected from outside, it needs no help from the driver.
+    void faultInject(char what);
+
   private:
     // Writes one block and reads the answer. Returns the total framed length
     // (3 + LEN + 2), or 0 if nothing valid came back.
@@ -137,6 +143,16 @@ class SE050
     bool reentered(const char *what);
 
     bool selectApplet();
+
+    // Session or channel gone: applet select, SCP03 and the UserID session again.
+    bool recover(const char *what);
+    // Session for an operation: the one already open, a first one on a fresh
+    // channel, or recover() when the channel is down.
+    bool ensureSession(const char *what);
+    // CheckObjectExists inside the session: 1 exists, 0 absent, -1 no usable answer.
+    int objectExists(uint32_t objId);
+    // Shared body of x25519Ensure / ed25519Ensure: curve and policy are the only difference.
+    bool keyEnsure(const char *what, uint32_t objId, uint8_t curve, const uint8_t policy[4], uint8_t publicKey[32]);
 
     // Curve, authenticator and UserID session - the idempotent preamble both
     // identity paths need before they can touch a key object.
