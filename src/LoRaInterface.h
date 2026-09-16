@@ -36,6 +36,10 @@ class LoRaInterface : public RNS::InterfaceImpl
     virtual ~LoRaInterface();
 
     bool online() const { return _online; }
+    int8_t txPowerDbm() const { return _params.txPowerDbm; }
+    // Retunes the PA without restarting the radio (the air parameters must not change at
+    // runtime: every node of the mesh has to agree on them). Power is at the antenna.
+    bool setTxPowerDbm(int8_t dbm);
     float lastRssi() const { return _lastRssi; }
     float lastSnr() const { return _lastSnr; }
     uint32_t rxFrames() const { return _rxFrames; }

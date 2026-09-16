@@ -11,6 +11,38 @@ static inline uint8_t packetSequence(uint8_t h)
     return h & LoRaInterface::HEADER_SEQ_MASK;
 }
 
+// Antenna dBm -> what the SX1262 is asked for: the module PA adds LORA_PA_GAIN_DB, and the
+// chip itself only accepts -9..LORA_SX1262_MAX_DBM.
+static int8_t sxPowerFor(int8_t antennaDbm)
+{
+    int8_t sxPower = antennaDbm - LORA_PA_GAIN_DB;
+    if (sxPower > LORA_SX1262_MAX_DBM)
+        sxPower = LORA_SX1262_MAX_DBM;
+    if (sxPower < -9)
+        sxPower = -9;
+    return sxPower;
+}
+
+bool LoRaInterface::setTxPowerDbm(int8_t dbm)
+{
+    if (!_radio)
+        return false;
+    int8_t sxPower = sxPowerFor(dbm);
+    int state = _radio->setOutputPower(sxPower);
+    if (state != RADIOLIB_ERR_NONE) {
+        ERRORF("%s: setOutputPower(%d) failed, code %d", toString().c_str(), sxPower, state);
+        return false;
+    }
+    // setOutputPower leaves the radio in standby on the SX126x; put it back in receive.
+    if ((state = _radio->startReceive()) != RADIOLIB_ERR_NONE) {
+        ERRORF("%s: startReceive after setOutputPower failed, code %d", toString().c_str(), state);
+        return false;
+    }
+    _params.txPowerDbm = dbm;
+    INFOF("%s: tx power now %d dBm at the antenna (SX1262 %d dBm)", toString().c_str(), dbm, sxPower);
+    return true;
+}
+
 LoRaInterface::LoRaInterface(const char *name, const Params &params) : RNS::InterfaceImpl(name), _params(params)
 {
     _IN = true;
@@ -43,11 +75,7 @@ bool LoRaInterface::start()
         _radio = new SX1262(_module);
     }
 
-    int8_t sxPower = _params.txPowerDbm - LORA_PA_GAIN_DB;
-    if (sxPower > LORA_SX1262_MAX_DBM)
-        sxPower = LORA_SX1262_MAX_DBM;
-    if (sxPower < -9)
-        sxPower = -9;
+    int8_t sxPower = sxPowerFor(_params.txPowerDbm);
 
     int state = _radio->begin(_params.frequencyMHz, _params.bandwidthKHz, _params.spreadingFactor,
                               _params.codingRate, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, sxPower,

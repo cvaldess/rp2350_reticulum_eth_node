@@ -9,7 +9,7 @@ proof the Meshtastic fork's HTTP OTA uses: a one-shot nonce from the node and
 SHA-256(nonce || PSK). The board name comes from the UF2's path (.pio/build/<env>/) unless
 --board says otherwise; the node refuses an image built for the other carrier.
 
-The PSK is read from include/node_config.h (NODE_OTA_PSK_HEX) unless --psk is given.
+The PSK is read from include/node_config.h (NODE_API_PSK_HEX) unless --psk is given.
 Only the standard library is needed.
 """
 import argparse
@@ -72,9 +72,10 @@ def psk_from_config():
     here = os.path.dirname(os.path.abspath(__file__))
     cfg = os.path.join(here, "..", "include", "node_config.h")
     with open(cfg, encoding="utf-8") as f:
-        m = re.search(r'#define\s+NODE_OTA_PSK_HEX\s+"([0-9a-fA-F]{64})"', f.read())
+        text = f.read()
+    m = re.search(r'#define\s+NODE_(?:API|OTA)_PSK_HEX\s+"([0-9a-fA-F]{64})"', text)
     if not m:
-        raise SystemExit("NODE_OTA_PSK_HEX not found in include/node_config.h; pass --psk")
+        raise SystemExit("NODE_API_PSK_HEX not found in include/node_config.h; pass --psk")
     return m.group(1)
 
 
@@ -95,13 +96,30 @@ def status(host, port):
     return json.loads(text)
 
 
+def get_nonce(host, port):
+    """/nonce is the shared API's; /ota/nonce is what images before the config API served, and a
+    node is usually updated from one to the other, so try the new path and fall back."""
+    for path in ("/nonce", "/ota/nonce"):
+        code, text = request(host, port, "GET", path, timeout=10)
+        if code == 200 and len(text) == 64:
+            return text
+    raise SystemExit("no nonce from %s:%d" % (host, port))
+
+
+def auth_headers(nonce, psk):
+    """Both spellings: an older image reads X-OTA-*, the current one X-Auth*. Each ignores the
+    other's, so one request works against either."""
+    auth = hashlib.sha256(bytes.fromhex(nonce) + psk).hexdigest()
+    return {"X-Auth-Nonce": nonce, "X-Auth": auth, "X-OTA-Nonce": nonce, "X-OTA-Auth": auth}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("firmware", nargs="?", help="firmware.uf2 (or raw .bin) to upload")
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=4244)
     ap.add_argument("--board", help="env name the node must match (default: from the UF2 path)")
-    ap.add_argument("--psk", help="64 hex chars (default: NODE_OTA_PSK_HEX from include/node_config.h)")
+    ap.add_argument("--psk", help="64 hex chars (default: NODE_API_PSK_HEX from include/node_config.h)")
     ap.add_argument("--status", action="store_true", help="just print /ota/status and exit")
     ap.add_argument("--wait", type=int, nargs="?", const=180, metavar="SECONDS",
                     help="after the upload, poll /ota/status until the new build is confirmed")
@@ -128,20 +146,16 @@ def main():
     if len(image) > before.get("image_max", 0):
         raise SystemExit("image (%d) larger than the node's sketch area (%d)" % (len(image), before["image_max"]))
 
-    code, nonce = request(args.host, args.port, "GET", "/ota/nonce", timeout=10)
-    if code != 200 or len(nonce) != 64:
-        raise SystemExit("nonce: HTTP %d %s" % (code, nonce))
-    auth = hashlib.sha256(bytes.fromhex(nonce) + psk).hexdigest()
-
-    t0 = time.time()
-    code, text = request(args.host, args.port, "PUT", "/ota", body=body, headers={
+    headers = {
         "Content-Type": "application/octet-stream",
         "Content-Length": str(len(body)),
-        "X-OTA-Nonce": nonce,
-        "X-OTA-Auth": auth,
         "X-OTA-SHA256": sha,
         "X-OTA-Board": board,
-    }, timeout=120)
+    }
+    headers.update(auth_headers(get_nonce(args.host, args.port), psk))
+
+    t0 = time.time()
+    code, text = request(args.host, args.port, "PUT", "/ota", body=body, headers=headers, timeout=120)
     print("upload: HTTP %d %s (%.1f s)" % (code, text, time.time() - t0))
     if code != 200:
         sys.exit(1)

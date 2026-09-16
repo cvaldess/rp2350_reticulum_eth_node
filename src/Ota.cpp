@@ -6,7 +6,6 @@
 #include <SHA256.h>
 #include <hardware/regs/addressmap.h>
 #include <string.h>
-#include <strings.h>
 
 Ota ota;
 
@@ -17,83 +16,8 @@ static const char *IMAGE_FILE = "firmware.bin";      // the name the OTA command
 static const char *PREV_FILE = "firmware.prev.bin";  // what was running when the last upload came in
 static const char *BUILD_STAMP = NODE_BUILD_ID; // "<sha7>[-dirty] <UTC time>" from tools/build_id.py
 
-static constexpr size_t HEAD_MAX = 2048;
-static constexpr uint32_t HEAD_TIMEOUT_MS = 3000;
 static constexpr uint32_t BODY_IDLE_TIMEOUT_MS = 30000;
 static constexpr size_t FS_KEEP_FREE = 64 * 1024; // room the Reticulum store must keep
-
-struct Ota::Request {
-    char method[8];
-    char path[32];
-    char nonce[65];
-    char auth[65];
-    char sha[65];
-    char board[40];
-    size_t contentLength;
-};
-
-// ---------------------------------------------------------------------------------- helpers
-static bool hexToBytes(const char *hex, uint8_t *out, size_t n)
-{
-    if (strlen(hex) != n * 2)
-        return false;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t v = 0;
-        for (int k = 0; k < 2; k++) {
-            char c = hex[i * 2 + k];
-            v <<= 4;
-            if (c >= '0' && c <= '9')
-                v |= c - '0';
-            else if (c >= 'a' && c <= 'f')
-                v |= c - 'a' + 10;
-            else if (c >= 'A' && c <= 'F')
-                v |= c - 'A' + 10;
-            else
-                return false;
-        }
-        out[i] = v;
-    }
-    return true;
-}
-
-static void bytesToHex(const uint8_t *in, size_t n, char *out)
-{
-    static const char *digits = "0123456789abcdef";
-    for (size_t i = 0; i < n; i++) {
-        out[i * 2] = digits[in[i] >> 4];
-        out[i * 2 + 1] = digits[in[i] & 15];
-    }
-    out[n * 2] = 0;
-}
-
-static bool constTimeEq(const uint8_t *a, const uint8_t *b, size_t n)
-{
-    uint8_t diff = 0;
-    for (size_t i = 0; i < n; i++)
-        diff |= a[i] ^ b[i];
-    return diff == 0;
-}
-
-// Header lookup, case-insensitive name, value trimmed and copied (bounded).
-static bool header(const char *head, const char *name, char *out, size_t cap)
-{
-    size_t n = strlen(name);
-    for (const char *p = head; (p = strstr(p, "\r\n")) != nullptr;) {
-        p += 2;
-        if (strncasecmp(p, name, n) == 0 && p[n] == ':') {
-            p += n + 1;
-            while (*p == ' ' || *p == '\t')
-                p++;
-            size_t len = 0;
-            while (p[len] && p[len] != '\r' && len + 1 < cap)
-                len++;
-            memcpy(out, p, len);
-            out[len] = 0;
-            return true;
-        }
-    }
-    return false;
-}
 
 static uint32_t sketchArea()
 {
@@ -246,12 +170,6 @@ void Ota::status(Print &out) const
 // ------------------------------------------------------------------------------------ loop
 void Ota::loop()
 {
-    static bool started = false;
-    if (!started && Ethernet.localIP() != IPAddress(0, 0, 0, 0)) {
-        _server.begin();
-        started = true;
-        Serial.printf("[ota] listening on %u\n", NODE_OTA_PORT);
-    }
     if (_rebootAt != 0 && (int32_t)(millis() - _rebootAt) >= 0) {
         Serial.println("[ota] rebooting into the staged image");
         Serial.flush();
@@ -265,92 +183,6 @@ void Ota::loop()
         Serial.flush();
         rp2040.reboot();
     }
-    if (started)
-        serve();
-}
-
-bool Ota::readHead(EthernetClient &client, char *buf, size_t cap, size_t &len)
-{
-    len = 0;
-    uint32_t t0 = millis();
-    while (client.connected() && millis() - t0 < HEAD_TIMEOUT_MS) {
-        while (client.available() && len + 1 < cap) {
-            buf[len++] = client.read();
-            buf[len] = 0;
-            if (len >= 4 && memcmp(buf + len - 4, "\r\n\r\n", 4) == 0)
-                return true;
-        }
-        if (len + 1 >= cap)
-            return false;
-        delay(1);
-    }
-    return false;
-}
-
-void Ota::serve()
-{
-    EthernetClient client = _server.accept();
-    if (!client)
-        return;
-    static char head[HEAD_MAX];
-    size_t len;
-    if (!readHead(client, head, sizeof(head), len)) {
-        replyError(client, 400, "bad request");
-        client.stop();
-        return;
-    }
-    Request req = {};
-    if (sscanf(head, "%7s %31s", req.method, req.path) != 2) {
-        replyError(client, 400, "bad request line");
-        client.stop();
-        return;
-    }
-    char tmp[16];
-    if (header(head, "Content-Length", tmp, sizeof(tmp)))
-        req.contentLength = strtoul(tmp, nullptr, 10);
-    header(head, "X-OTA-Nonce", req.nonce, sizeof(req.nonce));
-    header(head, "X-OTA-Auth", req.auth, sizeof(req.auth));
-    header(head, "X-OTA-SHA256", req.sha, sizeof(req.sha));
-    header(head, "X-OTA-Board", req.board, sizeof(req.board));
-
-    if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/ota/nonce") == 0)
-        handleNonce(client);
-    else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/ota/status") == 0)
-        handleStatus(client);
-    else if (strcmp(req.method, "PUT") == 0 && strcmp(req.path, "/ota") == 0)
-        handleUpload(client, req);
-    else
-        replyError(client, 404, "no such route");
-    client.flush();
-    client.stop();
-}
-
-void Ota::reply(EthernetClient &client, int code, const char *type, const char *body)
-{
-    client.printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n", code,
-                  code == 200 ? "OK" : "Error", type, (unsigned)strlen(body));
-    client.print(body);
-}
-
-void Ota::replyError(EthernetClient &client, int code, const char *what)
-{
-    char body[128];
-    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}\n", what);
-    reply(client, code, "application/json", body);
-}
-
-// A fresh 32-byte nonce, one shot, NODE_OTA_NONCE_TTL_S to use it.
-void Ota::handleNonce(EthernetClient &client)
-{
-    for (size_t i = 0; i < sizeof(_nonce); i += 4) {
-        uint32_t r = rp2040.hwrand32();
-        memcpy(_nonce + i, &r, 4);
-    }
-    _nonceIssued = millis();
-    _nonceValid = true;
-    char hex[65];
-    bytesToHex(_nonce, sizeof(_nonce), hex);
-    reply(client, 200, "text/plain", hex);
 }
 
 void Ota::handleStatus(EthernetClient &client)
@@ -361,39 +193,7 @@ void Ota::handleStatus(EthernetClient &client)
              "\"uptime_s\":%lu,\"fs_free\":%llu,\"image_max\":%lu}\n",
              NODE_BOARD_ID, BUILD_STAMP, stateName(_state), _sha, (unsigned long)_boots,
              (unsigned long)(millis() / 1000), (unsigned long long)fsFree(), (unsigned long)sketchArea());
-    reply(client, 200, "application/json", body);
-}
-
-// Nonce known, fresh and unused; auth = SHA-256(nonce || PSK). Any failure burns the nonce and
-// starts the cooldown, so guessing costs NODE_OTA_AUTH_COOLDOWN_S per try.
-bool Ota::authorised(const Request &req, const char **why)
-{
-    if (_lastAuthFailure != 0 && millis() - _lastAuthFailure < (uint32_t)NODE_OTA_AUTH_COOLDOWN_S * 1000) {
-        *why = "cooldown";
-        return false;
-    }
-    bool ok = false;
-    uint8_t nonce[32], auth[32], expect[32], psk[32];
-    if (!_nonceValid || millis() - _nonceIssued > (uint32_t)NODE_OTA_NONCE_TTL_S * 1000) {
-        *why = "no fresh nonce";
-    } else if (!hexToBytes(req.nonce, nonce, sizeof(nonce)) || !constTimeEq(nonce, _nonce, sizeof(nonce))) {
-        *why = "nonce mismatch";
-    } else if (!hexToBytes(req.auth, auth, sizeof(auth)) || !hexToBytes(NODE_OTA_PSK_HEX, psk, sizeof(psk))) {
-        *why = "bad auth encoding";
-    } else {
-        SHA256 sha;
-        sha.reset();
-        sha.update(_nonce, sizeof(_nonce));
-        sha.update(psk, sizeof(psk));
-        sha.finalize(expect, sizeof(expect));
-        ok = constTimeEq(auth, expect, sizeof(expect));
-        if (!ok)
-            *why = "auth mismatch";
-    }
-    _nonceValid = false;
-    if (!ok)
-        _lastAuthFailure = millis();
-    return ok;
+    HttpApi::reply(client, 200, "application/json", body);
 }
 
 // Streams the body into IMAGE_FILE while hashing it. Afterwards the file must hash to what
@@ -456,7 +256,7 @@ bool Ota::receiveBody(EthernetClient &client, size_t size, const uint8_t expectS
     f.close();
     uint8_t digest[32];
     sha.finalize(digest, sizeof(digest));
-    if (!constTimeEq(digest, expectSha, sizeof(digest))) {
+    if (!HttpApi::constTimeEq(digest, expectSha, sizeof(digest))) {
         LittleFS.remove(IMAGE_FILE);
         *why = "sha256 mismatch";
         return false;
@@ -475,26 +275,29 @@ bool Ota::receiveBody(EthernetClient &client, size_t size, const uint8_t expectS
     return true;
 }
 
-void Ota::handleUpload(EthernetClient &client, const Request &req)
+void Ota::handleUpload(EthernetClient &client, const HttpApi::Request &req)
 {
     const char *why = "";
-    if (!authorised(req, &why)) {
+    if (!httpApi.authorised(req, &why)) {
         Serial.printf("[ota] upload refused: %s\n", why);
-        replyError(client, 401, why);
+        HttpApi::replyError(client, 401, why);
         return;
     }
-    if (strcmp(req.board, NODE_BOARD_ID) != 0) {
-        Serial.printf("[ota] upload refused: image for '%s', this is %s\n", req.board, NODE_BOARD_ID);
-        replyError(client, 409, "image built for another board");
+    char board[40], shaHex[80];
+    req.header("X-OTA-Board", board, sizeof(board));
+    req.header("X-OTA-SHA256", shaHex, sizeof(shaHex));
+    if (strcmp(board, NODE_BOARD_ID) != 0) {
+        Serial.printf("[ota] upload refused: image for '%s', this is %s\n", board, NODE_BOARD_ID);
+        HttpApi::replyError(client, 409, "image built for another board");
         return;
     }
     uint8_t expectSha[32];
-    if (!hexToBytes(req.sha, expectSha, sizeof(expectSha))) {
-        replyError(client, 400, "X-OTA-SHA256 missing or malformed");
+    if (!HttpApi::hexToBytes(shaHex, expectSha, sizeof(expectSha))) {
+        HttpApi::replyError(client, 400, "X-OTA-SHA256 missing or malformed");
         return;
     }
     if (req.contentLength == 0 || req.contentLength > sketchArea()) {
-        replyError(client, 400, "Content-Length missing or implausible");
+        HttpApi::replyError(client, 400, "Content-Length missing or implausible");
         return;
     }
     // The image that was running when this upload came in is the rollback target. After a
@@ -516,33 +319,51 @@ void Ota::handleUpload(EthernetClient &client, const Request &req)
     if (fsFree() < req.contentLength + FS_KEEP_FREE) {
         Serial.printf("[ota] upload refused: %lu bytes free, %u + %u needed\n", (unsigned long)fsFree(),
                       (unsigned)req.contentLength, (unsigned)FS_KEEP_FREE);
-        replyError(client, 507, "not enough filesystem space");
+        HttpApi::replyError(client, 507, "not enough filesystem space");
         return;
     }
-    Serial.printf("[ota] receiving %u bytes for %s\n", (unsigned)req.contentLength, req.board);
+    Serial.printf("[ota] receiving %u bytes for %s\n", (unsigned)req.contentLength, board);
     uint32_t imageSize = 0;
     if (!receiveBody(client, req.contentLength, expectSha, imageSize, &why)) {
         Serial.printf("[ota] upload failed: %s\n", why);
-        replyError(client, 422, why);
+        HttpApi::replyError(client, 422, why);
         return;
     }
     picoOTA.begin();
     if (!picoOTA.addFile(IMAGE_FILE) || !picoOTA.commit()) {
         LittleFS.remove(IMAGE_FILE);
         Serial.println("[ota] could not stage the image (OTA command not written)");
-        replyError(client, 500, "could not stage the image");
+        HttpApi::replyError(client, 500, "could not stage the image");
         return;
     }
     _state = State::Pending;
     _boots = 0;
     _trialThisBoot = false; // the pending image is the *next* boot's trial, not this running one's
-    strncpy(_sha, req.sha, sizeof(_sha) - 1);
+    strncpy(_sha, shaHex, sizeof(_sha) - 1);
     save();
     char body[160];
-    snprintf(body, sizeof(body), "{\"ok\":true,\"sha256\":\"%s\",\"size\":%u,\"image\":%lu}\n", req.sha,
+    snprintf(body, sizeof(body), "{\"ok\":true,\"sha256\":\"%s\",\"size\":%u,\"image\":%lu}\n", shaHex,
              (unsigned)req.contentLength, (unsigned long)imageSize);
-    reply(client, 200, "application/json", body);
-    Serial.printf("[ota] staged %.8s... (%u bytes gzip, %lu bytes image), rebooting in 500 ms\n", req.sha,
+    HttpApi::reply(client, 200, "application/json", body);
+    Serial.printf("[ota] staged %.8s... (%u bytes gzip, %lu bytes image), rebooting in 500 ms\n", shaHex,
                   (unsigned)req.contentLength, (unsigned long)imageSize);
     _rebootAt = millis() + 500;
+}
+
+// ------------------------------------------------------------------------------------ routes
+static void thunkStatus(EthernetClient &client, const HttpApi::Request &req)
+{
+    (void)req;
+    ota.handleStatus(client);
+}
+
+static void thunkUpload(EthernetClient &client, const HttpApi::Request &req)
+{
+    ota.handleUpload(client, req);
+}
+
+void otaRegisterRoutes()
+{
+    httpApi.route("GET", "/ota/status", thunkStatus);
+    httpApi.route("PUT", "/ota", thunkUpload);
 }

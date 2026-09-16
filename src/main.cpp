@@ -4,7 +4,8 @@
 // Phase 1 added the W5500 and a TCPClientInterface to an rnsd on the LAN.
 // Phase 2 adds the E22 LoRa interface; a NODE_DISABLE_TCP build is the LoRa-only peer.
 // Phase 3 moved both identities into the SE050 (src/se050, VaultKeys.h).
-// Phase 4 adds the Ethernet OTA with a trial boot (Ota.h): USB is for the console only.
+// Phase 4 adds the Ethernet OTA with a trial boot (Ota.h) and the runtime settings
+// (NodeSettings.h) on a shared HTTP API (HttpApi.h): USB is for the console only.
 // Each node announces an application destination so the hosts can see it exists.
 
 #include <Arduino.h>
@@ -13,6 +14,8 @@
 
 #include "EthernetLink.h"
 #include "LoRaInterface.h"
+#include "HttpApi.h"
+#include "NodeSettings.h"
 #include "Ntp.h"
 #include "Ota.h"
 #include "PicoLittleFSFileSystem.h"
@@ -115,7 +118,7 @@ static void clockLoop()
         clockApply(unixMs, "ntp");
     if (ntp.pending() || !eth.hasIp())
         return;
-    uint32_t interval = (clockValid ? NODE_NTP_INTERVAL_S : NODE_NTP_RETRY_S) * 1000u;
+    uint32_t interval = (clockValid ? settings.ntpIntervalS() : NODE_NTP_RETRY_S) * 1000u;
     if (lastClockSync != 0 && millis() - lastClockSync < interval)
         return;
     lastClockSync = millis();
@@ -180,15 +183,17 @@ static bool reticulumSetup()
         }
 
 #ifndef NODE_DISABLE_TCP
-        tcp = new TCPClientInterface("TCPClientInterface", parseIp(RNS_TCP_TARGET_HOST), RNS_TCP_TARGET_PORT);
+        tcp = new TCPClientInterface("TCPClientInterface", parseIp(settings.tcpHost()), settings.tcpPort());
         tcp_interface = tcp;
         tcp_interface.mode(RNS::Type::Interface::MODE_FULL);
         RNS::Transport::register_interface(tcp_interface);
         tcp_interface.start();
 #endif
 
+        // The air parameters are compile-time: every node of the mesh has to agree on them.
+        // Only the power is a runtime setting, so a node in the switch can be turned down.
         LoRaInterface::Params lp = {LORA_FREQUENCY_MHZ,   LORA_BANDWIDTH_KHZ,    LORA_SPREADING_FACTOR,
-                                    LORA_CODING_RATE,     LORA_PREAMBLE_SYMBOLS, LORA_TX_POWER_DBM};
+                                    LORA_CODING_RATE,     LORA_PREAMBLE_SYMBOLS, settings.loraTxPowerDbm()};
         lora = new LoRaInterface("LoRaInterface", lp);
         lora_interface = lora;
         lora_interface.mode(RNS::Type::Interface::MODE_FULL);
@@ -311,6 +316,9 @@ static void handleConsole()
         case 'o':
             ota.status(Serial);
             break;
+        case 'c':
+            settings.status(Serial);
+            break;
         case 's':
             Serial.printf("[se050] %s\n", se050 ? "present, probe passed at boot" : "absent");
             break;
@@ -417,12 +425,14 @@ void setup()
         delay(50);
 
     Serial.println();
-    Serial.println("rp2350_reticulum_eth_node phase 4 (Ethernet OTA)");
+    Serial.println("rp2350_reticulum_eth_node phase 4 (Ethernet OTA + config API)");
     printHeap("boot");
 
     // Before anything that could fail: this is where a trial boot is counted and, if it is
     // one too many, where the previous image is put back.
     ota.begin();
+    // Before reticulumSetup(), which reads the rnsd address and the LoRa power from here.
+    settings.begin();
 
     eth.begin();
     se050Setup();
@@ -437,6 +447,11 @@ void setup()
         }
     }
 
+    // The radio exists now, so a power change over HTTP has somewhere to land.
+    settings.onTxPower([](int8_t dbm) { return lora && lora->setTxPowerDbm(dbm); });
+    otaRegisterRoutes();
+    nodeSettingsRegisterRoutes();
+
     Serial.printf("transport identity: %s\n", RNS::Transport::identity().hexhash().c_str());
     printHeap("after start");
     announcePending = true;
@@ -449,6 +464,8 @@ void loop()
     handleConsole();
     clockLoop();
     ota.loop();
+    httpApi.loop();
+    nodeSettingsLoop();
 
     // An OTA'd image has proved itself once the chip answered its probe and an announce went
     // out signed by it: the vault works and the node is reachable. Until then it is on trial.
@@ -458,7 +475,7 @@ void loop()
 #endif
 
     // First announce a few seconds after the node is reachable (TCP link up, or LoRa alone on a
-    // LoRa-only build), then every NODE_ANNOUNCE_INTERVAL_S.
+    // LoRa-only build), then every settings.announceIntervalS() (PUT /config retunes it live).
     static uint32_t onlineSince = 0;
     bool online = (tcp && tcp->connected()) || (!tcp && lora && lora->online());
     if (!online) {
@@ -468,7 +485,7 @@ void loop()
         announcePending = true;
     } else if (announcePending && millis() - onlineSince >= 5000) {
         announceNow("link up");
-    } else if (millis() - lastAnnounce >= (uint32_t)NODE_ANNOUNCE_INTERVAL_S * 1000) {
+    } else if (millis() - lastAnnounce >= settings.announceIntervalS() * 1000) {
         announceNow("periodic");
     }
 

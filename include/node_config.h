@@ -39,13 +39,14 @@
 #define LORA_PREAMBLE_SYMBOLS 8
 #define LORA_TX_POWER_DBM 10 // bench: boards a metre apart; raise once they are further away
 
-// Ethernet OTA (see docs/ota.md). The same wire as the Meshtastic fork's HTTP OTA: a nonce, a
-// SHA-256 over nonce||PSK to prove the uploader knows the key, the gzip'd image as the body.
-// The PSK is a bench value shared by both boards; a per-device key is the OTP task.
-#define NODE_OTA_PORT 4244
-#define NODE_OTA_PSK_HEX "43331e079ee9ce5ec2bf7bd10f91b0bf9aab2498d2ee71005dcc774b88bddb6c"
-#define NODE_OTA_NONCE_TTL_S 30
-#define NODE_OTA_AUTH_COOLDOWN_S 5
+// The HTTP API on the LAN: OTA (docs/ota.md) and the runtime settings (docs/config.md) share
+// one port and one auth. Wire taken from the Meshtastic fork's HTTP OTA: a nonce, a SHA-256 over
+// nonce||PSK to prove the caller knows the key. The PSK is a bench value shared by both boards;
+// a per-device key is the OTP task. LAN only: a pre-shared key is not internet-facing auth.
+#define NODE_API_PORT 4244
+#define NODE_API_PSK_HEX "43331e079ee9ce5ec2bf7bd10f91b0bf9aab2498d2ee71005dcc774b88bddb6c"
+#define NODE_API_NONCE_TTL_S 30
+#define NODE_API_AUTH_COOLDOWN_S 5
 // Trial boot after an OTA: the new image has to prove itself (SE050 probe passed and the
 // first announce went out signed) within this long, or it reboots; after this many unconfirmed
 // boots the previous image is put back. Overridable from the build (PLATFORMIO_BUILD_FLAGS) so a
