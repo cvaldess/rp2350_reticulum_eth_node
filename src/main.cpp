@@ -85,9 +85,38 @@ void setup()
     printHeap("after start");
 }
 
+// USB console: the only thing USB carries besides flashing.
+static void handleConsole()
+{
+    while (Serial.available()) {
+        switch (Serial.read()) {
+        case 'r':
+            Serial.println("rebooting");
+            Serial.flush();
+            rp2040.reboot();
+            break;
+        case 'i':
+            Serial.printf("transport identity: %s\n", RNS::Transport::identity().hexhash().c_str());
+            break;
+        case 'h':
+            printHeap("console");
+            break;
+        case 'f': {
+            fs::FSInfo info;
+            if (LittleFS.info(info))
+                Serial.printf("littlefs total=%llu used=%llu\n", info.totalBytes, info.usedBytes);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
 void loop()
 {
     reticulum.loop();
+    handleConsole();
 
     static uint32_t lastReport = 0;
     if (millis() - lastReport >= 10000) {
