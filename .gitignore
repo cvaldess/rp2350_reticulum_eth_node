@@ -5,3 +5,4 @@
 *.elf
 .DS_Store
 Thumbs.db
+bench/logs/

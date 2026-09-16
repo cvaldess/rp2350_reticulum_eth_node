@@ -14,6 +14,8 @@
 #include "PicoLittleFSFileSystem.h"
 #include "Rp2350Trng.h"
 #include "TCPClientInterface.h"
+#include "se050/SE050.h"
+#include <Wire.h>
 #include "board_pins.h"
 #include "node_config.h"
 
@@ -38,6 +40,32 @@ extern "C" int _write(int file, char *ptr, int len)
     int wrote = Serial.write(ptr, len);
     Serial.flush();
     return wrote;
+}
+
+// Secure element bring-up: the Meshtastic port's four-layer probe (T=1oI2C reset + applet
+// select, GetVersion/GetRandom, SCP03, on-chip X25519 identity + ECDH equivalence check).
+// Phase 3 hangs the Reticulum identity off this; tonight it only has to say hello and stay up.
+static void se050Setup()
+{
+#ifdef SE050_ENA_PIN
+    // ENA pulse = the only power-on reset the SE050 gets after an MCU reset (see the
+    // Meshtastic port). Only on carriers with the ENA hardware mod.
+    pinMode(SE050_ENA_PIN, OUTPUT);
+    digitalWrite(SE050_ENA_PIN, LOW);
+    delay(5);
+    digitalWrite(SE050_ENA_PIN, HIGH);
+    delay(250);
+#endif
+    Wire.setSDA(I2C_SDA);
+    Wire.setSCL(I2C_SCL);
+    Wire.begin();
+    Wire.setClock(100000);
+    se050 = new SE050(Wire, SE050_I2C_ADDR);
+    if (!se050->probe()) {
+        Serial.println("[se050] not available on this board");
+        delete se050;
+        se050 = nullptr;
+    }
 }
 
 static void printHeap(const char *tag)
@@ -145,6 +173,13 @@ static void handleConsole()
         case 'h':
             printHeap("console");
             break;
+        case 's':
+            Serial.printf("[se050] %s\n", se050 ? "present, probe passed at boot" : "absent");
+            break;
+        case 'p':
+            if (se050)
+                Serial.printf("[se050] re-probe %s\n", se050->probe() ? "OK" : "FAILED");
+            break;
         case 'e':
             eth.report();
             if (tcp)
@@ -189,6 +224,7 @@ void setup()
     printHeap("boot");
 
     eth.begin();
+    se050Setup();
 
     RNS::loglevel(RNS::LOG_DEBUG);
 
