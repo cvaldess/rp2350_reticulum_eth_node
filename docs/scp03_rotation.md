@@ -36,8 +36,17 @@ From the public NXP Plug&Trust headers and AN12436/AN12543:
 | P2 | `0x81` = `0x80` multiple \| `0x01` key id | `scp.h PUT_KEYS_KEY_IDENTIFIER` |
 | key type | `0x88` AES | `nxScp03_Const.h GPCS_KEY_TYPE_AES` |
 | KCV length | 3 | `nxScp03_Const.h CRYPTO_KEY_CHECK_LEN` |
-| KCV | AES-ECB(key, `01`×16)[:3] | GP Amd D |
-| component encryption | AES-CBC(current DEK, IV 0, no pad) | GP Amd D |
+| KCV | AES-ECB(key, `01`×16)[:3] | GP Amd D / demo |
+| component encryption | AES-CBC(current DEK, IV 0, no pad) | GP Amd D / demo |
+| per-key block | `88 11 10 <16 enc> 03 <3 kcv>` (23 B) | `se05x_TP_PlatformSCP03keys.c` createKeyData |
+| data field | `KVN ‖ block×3` (70 B), keys in ENC/MAC/DEK order | same |
+| success response | `KVN ‖ KCV_enc ‖ KCV_mac ‖ KCV_dek` (10 B) | same (memcmp verify-after-send) |
+
+The framing was confirmed against NXP's own rotation demo
+`se05x_RotatePlatformSCP03Keys/se05x_TP_PlatformSCP03keys.c` (public on GitHub, no
+registration): two length bytes per key (`0x11` = keyLen+1, then `0x10` = keyLen), which is
+the one thing the earlier draft had wrong (it omitted the first). `tools/scp03_rotate.py plan`
+now emits 70 bytes and the expected response to compare after the send.
 
 ## Validated offline (non-destructive)
 
@@ -55,10 +64,8 @@ From the public NXP Plug&Trust headers and AN12436/AN12543:
 
 ## What remains before the send (still non-destructive until the last step)
 
-1. **Confirm the data-field length framing** against an authoritative assembler — `nxScp03.c`
-   PutKeys (not in the public mirror) or GPC Amd D §PUT KEY. `plan` builds
-   `KVN ‖ {88,10,<enc>,03,<kcv>}×3` (67 bytes); the inner `10`/`11` length byte is the one
-   thing not yet cross-checked against NXP source. KCVs and encrypted components are validated.
+1. ~~Confirm the data-field length framing.~~ **Done** — matched to NXP's demo (above); `plan`
+   now emits the correct 70-byte field `KVN ‖ {88,11,10,<enc>,03,<kcv>}×3`.
 2. **Decide where the RP2350 keeps the new keys.** In LittleFS they are readable with
    `picotool save`; rotation then raises the bar from "public" to "dump the MCU flash", which
    is real but not a vault. A vault needs RP2350 secure boot + keys in OTP (its own decision:

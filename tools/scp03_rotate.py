@@ -150,26 +150,27 @@ def cmd_verify(host_hex, card_hex, cryptogram_hex):
 
 
 def build_put_key_data(kvn, enc, mac, dek_new, dek_current):
-    """Assemble the PUT KEY command data field, GP Amd D style:
+    """Assemble the PUT KEY command data field, exactly as NXP's own demo builds it
+    (se05x_RotatePlatformSCP03Keys / se05x_TP_PlatformSCP03keys.c, createKeyData):
 
-        KVN || { keyType, len, encryptedKeyComponent, kcvLen, KCV } x 3
+        KVN || { 0x88, keyLen+1, keyLen, encryptedKeyComponent(keyLen), kcvLen, KCV(kcvLen) } x 3
 
-    with keyType=0x88 (AES), the component encrypted under the CURRENT DEK, and a 3-byte KCV.
-    The three new keys go in ENC, MAC, DEK order.
+    with keyType 0x88 (AES), TWO length bytes (the AES-key-data length keyLen+1, then the
+    AES-key length keyLen), the component encrypted under the CURRENT DEK (AES-CBC, IV 0), and
+    a 3-byte KCV. The keys go in ENC, MAC, DEK order. Each block is 3 + keyLen + 1 + 3 bytes.
 
-    NOT YET CONFIRMED against an authoritative assembler (nxScp03.c PutKeys is not in the
-    public mirror). The framing of the inner length bytes is the one thing to check against
-    GPC Amd D / the full Plug&Trust demo before any send. Everything a length does not touch -
-    the KCVs and the encrypted components - is validated by selftest/verify.
+    Also returns the response the chip sends back on success: KVN followed by the three KCVs.
+    The demo does memcmp() of exactly this against the response - it is the verify-after-send.
     """
     data = bytes([kvn])
-    parts = []
+    expected_response = bytes([kvn])
     for key in (enc, mac, dek_new):
         enc_comp = dek_encrypt(dek_current, key)
-        block = bytes([KEY_TYPE_AES, len(enc_comp), *enc_comp, KCV_LEN, *kcv(key)])
-        parts.append(block)
+        kcv3 = kcv(key)
+        block = bytes([KEY_TYPE_AES, len(enc_comp) + 1, len(enc_comp), *enc_comp, KCV_LEN, *kcv3])
         data += block
-    return data, parts
+        expected_response += kcv3
+    return data, expected_response
 
 
 def cmd_plan(enc_hex, mac_hex, dek_hex):
@@ -191,12 +192,14 @@ def cmd_plan(enc_hex, mac_hex, dek_hex):
     for name, key in (("ENC", enc), ("MAC", mac), ("DEK", dek)):
         print(f"    KCV(new {name}) = {h(kcv(key))}   encrypted-under-current-DEK = {h(dek_encrypt(DEFAULT_DEK, key))}")
 
-    data, _ = build_put_key_data(KEY_VERSION, enc, mac, dek, DEFAULT_DEK)
+    data, expected = build_put_key_data(KEY_VERSION, enc, mac, dek, DEFAULT_DEK)
     header = bytes([0x84, 0xD8, KEY_VERSION, 0x80 | KEY_ID])
     print(f"\n  PUT KEY data field ({len(data)} bytes):\n    {h(data)}")
-    print(f"  APDU header (before SCP03 wrapping): {h(header)}  Lc = {len(data)}")
-    print("\n  NOTE: the data-field length framing is pending one authoritative confirmation")
-    print("  (nxScp03.c PutKeys / GPC Amd D). KCVs and encrypted components above are validated.")
+    print(f"  APDU header (0x80 CLA -> 0x84 after SCP03 wrapping): {h(header)}  Lc = {len(data)}")
+    print(f"\n  Expected chip response on success (KVN + the 3 KCVs): {h(expected)}")
+    print("  Verify-after-send: the chip echoes exactly this; a match means the keys went in.")
+    print("  Then immediately open a fresh channel with the NEW keys to confirm before trusting it.")
+    print("\n  Framing confirmed against NXP se05x_TP_PlatformSCP03keys.c (createKeyData).")
     print("  The send step is intentionally not implemented here.")
 
 
