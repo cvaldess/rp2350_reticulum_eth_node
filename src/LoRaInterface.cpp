@@ -156,8 +156,18 @@ void LoRaInterface::loop()
         }
     } else if (state != RADIOLIB_ERR_NONE) {
         DEBUGF("%s: readData failed, code %d", toString().c_str(), state);
+        // A CRC error leaves the radio in RX like any other frame; anything else (SPI timeout, ...)
+        // is a chip we no longer trust to be listening, so re-arm it.
+        if (state != RADIOLIB_ERR_CRC_MISMATCH)
+            _radio->startReceive();
     }
-    _radio->startReceive();
+    // Do NOT re-arm with startReceive() here. The SX1262 stays in continuous RX after RX_DONE and
+    // stores the next frame at the offset readData() honours (getPacketLength(true, &offset)), whereas
+    // RadioLib's startReceive() goes through standby() + setBufferBaseAddress() + clearIrqStatus():
+    // a frame that started arriving while we were processing this one (hashlist write, decrypt, a
+    // signature check: 100+ ms) would be silently aborted, and one that already completed would be
+    // erased unread. That is how the IDENTIFY of `rnstatus -R` (sent right behind the link RTT) was
+    // lost on every two-hop attempt. The only re-arm is after a transmit, in send_outgoing().
 }
 
 bool LoRaInterface::transmitFrame(const uint8_t *buf, size_t len)
