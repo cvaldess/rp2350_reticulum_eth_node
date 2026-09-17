@@ -3,6 +3,8 @@
     python tools/node_config.py --host 192.168.1.191                       # show
     python tools/node_config.py --host 192.168.1.191 --set announce_interval_s=600
     python tools/node_config.py --host 192.168.1.191 --set lora_tx_power_dbm=0 --set ntp_interval_s=3600
+    python tools/node_config.py --host 192.168.1.191 --set ip=192.168.1.191 --reboot   # DHCP, that as fallback
+    python tools/node_config.py --host 192.168.1.191 --set ip_mode=static --reboot     # static only, on trial
     python tools/node_config.py --host 192.168.1.191 --reset               # back to build defaults
     python tools/node_config.py --host 192.168.1.191 --reboot              # apply a boot-only change
 
@@ -17,13 +19,23 @@ import sys
 from ota_upload import auth_headers, get_nonce, psk_from_config, request
 
 
+STATUS_KEYS = ("ip_trial", "ip_source")  # state the node reports, not settings
+
+
 def show(cfg):
     over = set(cfg.get("overridden", []))
     defaults = cfg.get("defaults", {})
     print("%-22s %-18s %s" % ("setting", "value", "source"))
-    for k in [k for k in cfg if k not in ("overridden", "defaults", "reboot_pending")]:
+    for k in [k for k in cfg if k not in ("overridden", "defaults", "reboot_pending") + STATUS_KEYS]:
         src = "set" if k in over else "default (%s)" % defaults.get(k, "?")
         print("%-22s %-18s %s" % (k, cfg[k], src))
+    if "ip_source" in cfg:
+        print("\nrunning address: %s; static ip trial: %s" % (cfg["ip_source"], cfg.get("ip_trial", "?")))
+    if cfg.get("ip_trial") == "pending":
+        print("  the static ip goes on trial at the next boot: reach the API at the new address within "
+              "10 min (any request, e.g. this tool) or the node goes back to DHCP")
+    elif cfg.get("ip_trial") == "reverted":
+        print("  a static ip was NOT reached in time and the node went back to DHCP (ip kept as the fallback)")
     if cfg.get("reboot_pending"):
         print("\na setting that only takes effect at boot has changed: --reboot to apply it")
 

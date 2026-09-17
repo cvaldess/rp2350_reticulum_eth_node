@@ -434,7 +434,13 @@ void setup()
     // Before reticulumSetup(), which reads the rnsd address and the LoRa power from here.
     settings.begin();
 
-    eth.begin();
+    {
+        EthernetLink::Address addr;
+        addr.staticOnly = settings.ipStaticOnly();
+        addr.hasStatic = settings.staticAddress(addr.ip, addr.subnet, addr.gateway, addr.dns);
+        eth.begin(addr);
+    }
+    settings.onIpSource([]() { return EthernetLink::sourceName(eth.source()); });
     se050Setup();
 
     RNS::loglevel(RNS::LOG_DEBUG);

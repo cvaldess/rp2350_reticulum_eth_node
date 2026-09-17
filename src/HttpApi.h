@@ -33,6 +33,10 @@ class HttpApi
 
     // Checks X-Auth against the outstanding nonce. Consumes the nonce either way.
     bool authorised(const Request &req, const char **why);
+    // Called once per well-formed request, before it is routed: somebody on the LAN reached this
+    // address. The static-IP trial (NodeSettings) takes that as its proof of reachability — if the
+    // API can be reached at all, so can whoever has to fix the configuration.
+    void onRequest(void (*fn)()) { _onRequest = fn; }
 
     static void reply(EthernetClient &client, int code, const char *type, const char *body);
     static void replyError(EthernetClient &client, int code, const char *what);
@@ -65,6 +69,7 @@ class HttpApi
     uint32_t _nonceIssued = 0;
     bool _nonceValid = false;
     uint32_t _lastAuthFailure = 0;
+    void (*_onRequest)() = nullptr;
 };
 
 extern HttpApi httpApi;

@@ -55,3 +55,12 @@
 #define NODE_OTA_TRIAL_TIMEOUT_S 600
 #endif
 #define NODE_OTA_TRIAL_BOOTS 3
+
+// A static IP (ip_mode=static over PUT /config, docs/config.md) boots on trial like an OTA image:
+// unless a request reaches the API at that address within the timeout, or
+// after this many unconfirmed boots, the node goes back to DHCP and reboots. DHCP with a static
+// fallback needs no trial: a wrong fallback only matters while the DHCP server is down.
+#ifndef NODE_IP_TRIAL_TIMEOUT_S
+#define NODE_IP_TRIAL_TIMEOUT_S 600
+#endif
+#define NODE_IP_TRIAL_BOOTS 3

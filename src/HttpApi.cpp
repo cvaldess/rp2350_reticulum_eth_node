@@ -221,6 +221,10 @@ void HttpApi::serve()
     if (req.header("Content-Length", tmp, sizeof(tmp)))
         req.contentLength = strtoul(tmp, nullptr, 10);
 
+    // A well-formed request, whatever it asks for: somebody reached this address.
+    if (_onRequest)
+        _onRequest();
+
     if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/nonce") == 0) {
         handleNonce(client);
     } else {
