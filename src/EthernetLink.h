@@ -18,9 +18,12 @@
 class EthernetLink
 {
   public:
-    // The watchdog is disabled across setup() (main.cpp), so this blocking call is not bound by the
-    // watchdog window; ~6-7 s is a normal cold-boot lease on this network. If no lease comes the
-    // static fallback (when set) takes over.
+    // This blocking call is longer than the watchdog window (8 s, node_config.h): main.cpp feeds the
+    // watchdog right before it, so a boot after a trip (the watchdog stays armed across the reset)
+    // gets the whole window; ~6-7 s is a normal cold-boot lease on this network. If no lease comes
+    // the static fallback (when set) takes over. The lease renewal in loop() reuses this timeout
+    // inside Ethernet.maintain(): a DHCP server silent for > 8 s at renewal time trips the watchdog
+    // and the node comes back on the fallback address. Known, accepted.
     static constexpr uint32_t DHCP_TIMEOUT_MS = 10000;
     static constexpr uint32_t DHCP_RETRY_TIMEOUT_MS = 4000;
     static constexpr uint32_t DHCP_RETRY_INTERVAL_MS = 30000;

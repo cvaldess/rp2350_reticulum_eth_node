@@ -23,7 +23,14 @@
 // next setup(), so each long blocking call in setup() is fed first (a no-op on a clean boot, the
 // reboot-loop breaker after a trip); it is armed at the end of setup() and loop() feeds it. This is
 // the Meshtastic rp2xx0 pattern (feed-before-blocking + arm + feed-in-loop).
-#ifdef ARCH_RP2040
+//
+// Guard on the macro the toolchain defines (ARDUINO_ARCH_RP2040, from the board's extra_flags), NOT
+// on ARCH_RP2040: that one is defined by se050/se050_port.h, which is included further down, so an
+// #ifdef ARCH_RP2040 here is false while the one that arms the watchdog at the end of setup() is
+// true. That is exactly what shipped on 2026-09-17: armed, never fed from loop(), and the node
+// rebooted 8 s after the last SE050 operation (the driver feeds inside its own calls), which read as
+// a "~15 s trip with the loop running". main.cpp.o had no reference to watchdog_update at all.
+#ifdef ARDUINO_ARCH_RP2040
 #include <hardware/watchdog.h>
 #define FEED_WDT() rp2040.wdt_reset()
 #else
@@ -438,6 +445,18 @@ static void handleConsole()
         case 'a':
             announceNow("console", true);
             break;
+#ifdef ARDUINO_ARCH_RP2040
+        case 'W': { // the positive control: stall loop() past the window without feeding
+            const uint32_t stallMs = NODE_WATCHDOG_TIMEOUT_MS > 0 ? NODE_WATCHDOG_TIMEOUT_MS + 4000 : 12000;
+            Serial.printf("[wdt] stalling %lu ms without feeding: an armed watchdog reboots the node now\n",
+                          (unsigned long)stallMs);
+            Serial.flush();
+            for (uint32_t t0 = millis(); millis() - t0 < stallMs;) {
+            }
+            Serial.println("[wdt] survived the stall: the watchdog is NOT armed");
+            break;
+        }
+#endif
         case 'f': {
             fs::FSInfo info;
             if (LittleFS.info(info))
@@ -467,6 +486,16 @@ void setup()
     Serial.println();
     Serial.println("rp2350_reticulum_eth_node phase 4 (Ethernet OTA + config API)");
     printHeap("boot");
+#ifdef ARDUINO_ARCH_RP2040
+    // The reason register survives the reset. A timer trip with the enable magic in scratch[4] is
+    // the watchdog catching a stalled loop(); a trip without it is our own rp2040.reboot().
+    if (watchdog_enable_caused_reboot())
+        Serial.println("[wdt] REBOOTED BY THE WATCHDOG: the previous run stopped feeding it");
+    else if (watchdog_caused_reboot())
+        Serial.println("[boot] software reboot (rp2040.reboot: console, OTA, low heap)");
+    else
+        Serial.println("[boot] power-on or RUN-pin reset");
+#endif
     FEED_WDT(); // a watchdog left armed by a previous trip is already ticking through this setup()
 
     // Before anything that could fail: this is where a trial boot is counted and, if it is
@@ -508,10 +537,11 @@ void setup()
     // Bring-up is done: arm the watchdog. From here loop() has to feed it, so a hang below
     // Reticulum, a wedged SPI transaction or a stuck interface reboots the node instead of
     // leaving it dark in the switch. NODE_WATCHDOG_TIMEOUT_MS=0 disables it (bench).
-#ifdef ARCH_RP2040
+#ifdef ARDUINO_ARCH_RP2040
     if (NODE_WATCHDOG_TIMEOUT_MS > 0) {
         rp2040.wdt_begin(NODE_WATCHDOG_TIMEOUT_MS);
-        Serial.printf("[wdt] armed, %d ms\n", NODE_WATCHDOG_TIMEOUT_MS);
+        Serial.printf("[wdt] armed, %d ms (window now %lu ms)\n", NODE_WATCHDOG_TIMEOUT_MS,
+                      (unsigned long)watchdog_get_time_remaining_ms());
     } else {
         Serial.println("[wdt] disabled (see node_config.h)");
     }
@@ -519,8 +549,21 @@ void setup()
     announcePending = true;
 }
 
+#ifdef ARDUINO_ARCH_RP2040
+// Smallest window left when loop() came round to feed, since the last [loop] line: the margin the
+// slowest pass (an SE050 signature, a store compaction, an OTA upload) leaves before a trip.
+static uint32_t wdtMinRemainingMs = UINT32_MAX;
+#endif
+
 void loop()
 {
+#ifdef ARDUINO_ARCH_RP2040
+    if (NODE_WATCHDOG_TIMEOUT_MS > 0) {
+        uint32_t remaining = watchdog_get_time_remaining_ms();
+        if (remaining < wdtMinRemainingMs)
+            wdtMinRemainingMs = remaining;
+    }
+#endif
     FEED_WDT();
     checkLowHeap();
     eth.loop();
@@ -558,5 +601,12 @@ void loop()
         lastReport = millis();
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
         printHeap("loop");
+#ifdef ARDUINO_ARCH_RP2040
+        if (NODE_WATCHDOG_TIMEOUT_MS > 0) {
+            Serial.printf("[wdt] min window left at feed %lu ms of %d\n", (unsigned long)wdtMinRemainingMs,
+                          NODE_WATCHDOG_TIMEOUT_MS);
+            wdtMinRemainingMs = UINT32_MAX;
+        }
+#endif
     }
 }

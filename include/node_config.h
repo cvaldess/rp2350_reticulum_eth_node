@@ -65,16 +65,15 @@
 #endif
 #define NODE_IP_TRIAL_BOOTS 3
 
-// 24x7 hardening (Fase 5). A hardware watchdog would reboot the node if loop() stopped feeding it.
-// DISABLED for now (0): on this RP2350 + arduino-pico, wdt_begin(8000) + a per-loop wdt_reset()
-// reboots a perfectly healthy node dead-regular ~15 s after arming, with the log running right up
-// to the reset (loop is iterating and feeding). Removing the setup-time watchdog_disable() did not
-// change it. So watchdog_update() is not holding off the timer here, and ~15 s vs 8 s hints the
-// load is ~2x (the RP2040 errata compensation misapplied on RP2350). Needs a raw-register / tick
-// investigation before it can be armed; the scaffolding (arm at end of setup, FEED_WDT in loop,
-// SE050 + OTA feeds) stays so re-enabling is just this value. See the RP2350 watchdog bench notes.
+// 24x7 hardening (Fase 5). The hardware watchdog reboots the node if loop() stops feeding it for
+// this long (0 disables it). 8 s is the Meshtastic rp2xx0 value; the slowest single loop() pass
+// here is an SE050 signature (~250 ms) or an OTA upload (fed from inside). The "reboots a healthy
+// node after ~15 s" of 2026-09-17 was the feed compiled out of main.cpp (wrong #ifdef macro, see
+// FEED_WDT in main.cpp), not the timer: the node lived 8 s past its last SE050 call.
+// Console 'W' stalls loop() past the window on purpose to prove the trip; the boot banner says
+// when a boot was a watchdog trip; the [loop] line reports the smallest window left at feed time.
 #ifndef NODE_WATCHDOG_TIMEOUT_MS
-#define NODE_WATCHDOG_TIMEOUT_MS 0
+#define NODE_WATCHDOG_TIMEOUT_MS 8000
 #endif
 // The node reboots when the free heap stays below this for NODE_LOW_HEAP_HOLD_MS. Free heap sits
 // ~460 kB in normal operation; this is the "allocations are about to fail" floor, held long enough
