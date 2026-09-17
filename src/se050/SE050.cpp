@@ -26,9 +26,11 @@ SE050 *se050 = nullptr;
 // transaction, that is exactly what must not happen. The wait is short and the
 // watchdog is fed explicitly around it.
 #define SE050_WAIT_MS(ms) busy_wait_us_32((ms)*1000u)
+#define SE050_WAIT_US(us) busy_wait_us_32(us)
 #else
 #define SE050_FEED_WATCHDOG() ((void)0)
 #define SE050_WAIT_MS(ms) delay(ms)
+#define SE050_WAIT_US(us) delayMicroseconds(us)
 #endif
 
 namespace
@@ -94,8 +96,9 @@ size_t SE050::xfer(const uint8_t *tx, size_t txLen, uint8_t *rx, size_t rxCap)
     uint8_t header[3];
     bool haveHeader = false;
     waiting = true;
-    for (int attempt = 0; attempt < POLL_ATTEMPTS && !haveHeader; attempt++) {
-        SE050_WAIT_MS(POLL_INTERVAL_MS);
+    const int attempts = POLL_ATTEMPTS * (int)(POLL_INTERVAL_MS * 1000) / (int)pollIntervalUs; // same 4 s ceiling whatever the interval
+    for (int attempt = 0; attempt < attempts && !haveHeader; attempt++) {
+        SE050_WAIT_US(pollIntervalUs);
         SE050_FEED_WATCHDOG(); // this loop can run for seconds
         if (bus.requestFrom(address, sizeof(header)) == sizeof(header)) {
             for (size_t i = 0; i < sizeof(header); i++)
@@ -971,9 +974,9 @@ bool SE050::ed25519Ensure(uint32_t objId, uint8_t publicKey[32])
     return keyEnsure("Ed25519", objId, 0x40, POLICY, publicKey); // ID_ECC_ED_25519
 }
 
-bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32])
+bool SE050::x25519EcdhBytes(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32])
 {
-    if (reentered("x25519Ecdh"))
+    if (reentered("x25519EcdhBytes"))
         return false;
 
     uint8_t keyId[4];
@@ -997,7 +1000,7 @@ bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t sha
     uint16_t sw = 0;
     uint32_t t0 = millis();
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (!ensureSession("x25519Ecdh"))
+        if (!ensureSession("x25519EcdhBytes"))
             return false;
         int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
         if (sw == 0x9000) {
@@ -1017,6 +1020,159 @@ bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t sha
         scp.open = sessionActive = false;
     }
     return false;
+}
+
+bool SE050::peerKeyWrite(uint32_t objId, const uint8_t valueBe[32], bool create, bool transient, uint16_t *sw)
+{
+    uint8_t authId[4], keyId[4];
+    be32(AUTH_OBJ, authId);
+    be32(objId, keyId);
+
+    // INS_WRITE, plus INS_TRANSIENT (0x80) for a new transient object. The chip ignores
+    // that bit on an existing object, but the create/update split is real: policy and
+    // curve are refused once the id is in use. P1 = P1_PUBLIC | P1_EC, read on creation.
+    const uint8_t hdr[4] = {0x80, (uint8_t)((create && transient) ? 0x81 : 0x01), 0x21, 0x00};
+    uint8_t d[64];
+    int j = 0;
+    if (create) {
+        // AR header 0x04340000: ALLOW_KA | READ | WRITE | DELETE, bound to the UserID
+        // authenticator like every other object here. WRITE is the one that matters:
+        // it is what lets the value be replaced before every agreement.
+        static const uint8_t POLICY[4] = {0x04, 0x34, 0x00, 0x00};
+        d[j++] = 0x11; // TAG_POLICY
+        d[j++] = 0x09;
+        d[j++] = 0x08;
+        memcpy(&d[j], authId, 4);
+        j += 4;
+        memcpy(&d[j], POLICY, 4);
+        j += 4;
+    }
+    d[j++] = 0x41; // TAG_1: object id
+    d[j++] = 0x04;
+    memcpy(&d[j], keyId, 4);
+    j += 4;
+    if (create) {
+        d[j++] = 0x42; // TAG_2: curve, ID_ECC_MONT_DH_25519
+        d[j++] = 0x01;
+        d[j++] = 0x41;
+    }
+    d[j++] = 0x44; // TAG_4: public key value, big-endian (AN12413 section 7)
+    d[j++] = 0x20;
+    memcpy(&d[j], valueBe, 32);
+    j += 32;
+
+    uint8_t r[32];
+    *sw = 0;
+    sessionApdu(hdr, d, j, false, r, sizeof(r), sw);
+    return *sw == 0x9000;
+}
+
+bool SE050::deleteObject(uint32_t objId, uint16_t *sw)
+{
+    uint8_t keyId[4];
+    be32(objId, keyId);
+    const uint8_t h[4] = {0x80, 0x04, 0x00, 0x28}; // INS_MGMT, P1_DEFAULT, P2_DELETE_OBJECT
+    uint8_t d[] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3]};
+    uint8_t r[32];
+    *sw = 0;
+    sessionApdu(h, d, sizeof(d), false, r, sizeof(r), sw);
+    return *sw == 0x9000;
+}
+
+bool SE050::x25519EcdhObject(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32])
+{
+    if (reentered("x25519EcdhObject"))
+        return false;
+
+    uint8_t keyId[4], peerId[4];
+    be32(objId, keyId);
+    be32(PEER_KEY_OBJ, peerId);
+    uint8_t peerBe[32];
+    reverse(peerPublic, peerBe, 32);
+
+    const uint8_t h[4] = {0x80, 0x03, 0x01, 0x0F}; // INS_CRYPTO, P1_EC, P2_DH
+    uint8_t d[12];
+    int j = 0;
+    d[j++] = 0x41; // TAG_1: the on-chip private key
+    d[j++] = 0x04;
+    memcpy(&d[j], keyId, 4);
+    j += 4;
+    d[j++] = 0x43; // TAG_3: the peer public key, by object id
+    d[j++] = 0x04;
+    memcpy(&d[j], peerId, 4);
+    j += 4;
+
+    uint8_t r[128];
+    uint16_t sw = 0;
+    uint32_t t0 = millis();
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!ensureSession("x25519EcdhObject"))
+            return false;
+
+        // The object outlives sessions, channels and resets (its attributes are in NVM),
+        // so this is one CheckObjectExists per run, not per agreement. Creating it is the
+        // one NVM write of the whole scheme.
+        bool written = false;
+        if (!peerObjReady) {
+            int exists = objectExists(PEER_KEY_OBJ);
+            if (exists < 0) {
+                scp.open = sessionActive = false; // rebuild on the next lap
+                continue;
+            }
+            if (exists == 0) {
+                LOG_INFO("SE050: no peer key object at 0x%08x yet, creating it (transient)", (unsigned)PEER_KEY_OBJ);
+                if (!peerKeyWrite(PEER_KEY_OBJ, peerBe, true, true, &sw)) {
+                    // A refusal to create (6A84 no transient memory, 6A80 bad TLV...) is not
+                    // a session problem: nothing to rebuild, the caller falls back.
+                    LOG_WARN("SE050: WriteECKey (create peer object 0x%08x) SW=%04x", (unsigned)PEER_KEY_OBJ, sw);
+                    return false;
+                }
+                written = true;
+            }
+            peerObjReady = true;
+        }
+        if (!written && !peerKeyWrite(PEER_KEY_OBJ, peerBe, false, true, &sw)) {
+            // Either the session is gone, or the object is there but not as expected (a
+            // persistent one under the same id, another policy): the retry answers both,
+            // because it asks the chip about the object again.
+            LOG_WARN("SE050: WriteECKey (peer object 0x%08x) SW=%04x%s", (unsigned)PEER_KEY_OBJ, sw,
+                     attempt == 0 ? ", rebuilding and retrying" : "");
+            peerObjReady = false;
+            scp.open = sessionActive = false;
+            continue;
+        }
+
+        int rl = sessionApdu(h, d, j, true, r, sizeof(r), &sw);
+        if (sw == 0x9000) {
+            int vl;
+            const uint8_t *v = tlv1(r, rl, &vl);
+            if (!v || vl != 32)
+                return false;
+            reverse(v, shared, 32);
+            if (attempt > 0)
+                LOG_INFO("SE050: ECDH via object completed on the retry, %u ms end to end", (unsigned)(millis() - t0));
+            return true;
+        }
+        LOG_WARN("SE050: ECDH via object (0x%08x) SW=%04x%s", (unsigned)objId, sw, attempt == 0 ? ", rebuilding and retrying" : "");
+        peerObjReady = false;
+        scp.open = sessionActive = false;
+    }
+    return false;
+}
+
+bool SE050::x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32])
+{
+    if (ecdhViaObject && x25519EcdhObject(objId, peerPublic, shared))
+        return true;
+    bool ok = x25519EcdhBytes(objId, peerPublic, shared);
+    // The object path rebuilt and retried on its own before giving up, so if the chip
+    // answers the byte-array form right after, it is that path it refuses, not the
+    // session: stop asking. A chip that is simply gone fails both and keeps the setting.
+    if (ok && ecdhViaObject) {
+        ecdhViaObject = false;
+        LOG_WARN("SE050: key agreement via the peer object refused, byte-array form (an NVM write per call) for the rest of the run");
+    }
+    return ok;
 }
 
 bool SE050::ed25519Sign(uint32_t objId, const uint8_t *message, size_t len, uint8_t signature[64])
@@ -1448,6 +1604,8 @@ bool SE050::sign(const uint8_t *message, size_t len, uint8_t signature[64])
 
 bool SE050::probe()
 {
+    ecdhViaObject = ECDH_VIA_OBJECT_DEFAULT; // a re-probe gives the peer-object path another chance
+    peerObjReady = false;
     if (!open()) {
         LOG_ERROR("SE050: bring-up failed at 0x%x", address);
         return false;
@@ -1525,16 +1683,10 @@ bool SE050::probe()
     Curve25519::dh1(testPublic, testPrivate);
 
     uint8_t sharedChip[32];
-    if (!identityEcdh(testPublic, sharedChip)) {
+    if (!x25519EcdhBytes(activeKeyObj, testPublic, sharedChip)) {
         LOG_WARN("SE050: ECDH failed, cannot compare against software");
         return true;
     }
-
-#ifdef SE050_BENCHMARK
-    // dh2 destroys the private key it is given, so keep a copy for the benchmark below.
-    uint8_t benchPrivate[32];
-    memcpy(benchPrivate, testPrivate, 32);
-#endif
 
     uint8_t sharedSoft[32];
     memcpy(sharedSoft, ourPublic, 32);
@@ -1555,39 +1707,7 @@ bool SE050::probe()
     }
 
 #ifdef SE050_BENCHMARK
-    // What one key agreement costs. Meshtastic runs a full ECDH per PKI packet, so
-    // this number, not correctness, decides whether the chip can back the radio path.
-    // Each round is a UserID session nested inside SCP03, which means AES-CMAC plus
-    // AES-CBC over both the command and the response, all over I2C at 100 kHz.
-    // Build-time opt-in (5 extra agreements, ~300ms, on every boot) - useful during
-    // bring-up, not something a shipped device needs to redo every reset.
-    constexpr int ROUNDS = 5;
-    uint32_t best = UINT32_MAX, worst = 0, total = 0;
-    int done = 0;
-    for (int i = 0; i < ROUNDS; i++) {
-        uint8_t tmp[32];
-        uint32_t t0 = micros();
-        bool ok = identityEcdh(testPublic, tmp);
-        uint32_t dt = micros() - t0;
-        if (!ok) {
-            LOG_WARN("SE050: ECDH timing aborted, round %d failed", i + 1);
-            break;
-        }
-        total += dt;
-        best = min(best, dt);
-        worst = max(worst, dt);
-        done++;
-    }
-
-    uint8_t softShared[32];
-    memcpy(softShared, ourPublic, 32);
-    uint32_t t0 = micros();
-    Curve25519::dh2(softShared, benchPrivate);
-    uint32_t softUs = micros() - t0;
-
-    if (done > 0)
-        LOG_INFO("SE050: ECDH cost over %d rounds: min %u ms, avg %u ms, max %u ms | software %u ms (%ux)", done, best / 1000,
-                 (total / done) / 1000, worst / 1000, softUs / 1000, softUs ? (total / done) / softUs : 0);
+    benchEcdhNvm(); // the boot-time run; the console's 'B' does the same on demand
 #endif
 
     // Same equivalence check for the signing key: sign in the chip, verify with the
@@ -1633,6 +1753,266 @@ bool SE050::probe()
     }
 
     return true;
+}
+
+// Where the NVM write is, if anywhere, in an X25519 agreement - measured, since the chip
+// gives no way to see its NVM directly. Results and the reading of them:
+// docs/se050_ecdh_nvm.md. Each APDU is a UserID session nested inside SCP03 (AES-CMAC +
+// AES-CBC both ways) over I2C, so the wire alone is a few ms and "TAG_2 vs TAG_3" on its
+// own cannot tell an NVM write from the two AES blocks TAG_2 carries more. Hence the
+// controls: the same WriteECKey, byte for byte, into a persistent object (which does write
+// NVM) next to the transient one; EdDSASign over 1 and 33 bytes (same computation, exactly
+// two blocks apart) to price the wire; and the TAG_3 agreement against the persistent object
+// (same bytes as the transient one). Three peer keys rotate so no write repeats the value an
+// object already holds - a chip may skip those. Min is the statistic: the process is
+// fixed-cost, the jitter is all above it. Leaves the chip as it found it, plus PEER_KEY_OBJ.
+void SE050::benchEcdhNvm()
+{
+    if (reentered("benchEcdhNvm"))
+        return;
+    uint8_t ourPublic[32], tmp[32], be[32];
+    if (!identityEnsure(ourPublic)) {
+        LOG_WARN("SE050: bench: identity not available");
+        return;
+    }
+    // Three software keypairs and the secrets the chip has to reproduce.
+    uint8_t pubs[3][32], softs[3][32];
+    for (int k = 0; k < 3; k++) {
+        uint8_t prv[32];
+        Curve25519::dh1(pubs[k], prv);
+        memcpy(softs[k], ourPublic, 32);
+        Curve25519::dh2(softs[k], prv);
+    }
+    // The agreement through the transient peer object, checked before it is timed. This
+    // is also what creates the object on a chip that has none (its one NVM write).
+    if (!x25519EcdhObject(activeKeyObj, pubs[0], tmp)) {
+        LOG_WARN("SE050: bench: ECDH via the transient peer object failed, nothing to compare");
+        return;
+    }
+    if (memcmp(tmp, softs[0], 32) != 0) {
+        LOG_ERROR("SE050: bench: ECDH via the transient peer object does NOT match software");
+        return;
+    }
+    LOG_INFO("SE050: bench: ECDH via the transient peer object matches software");
+
+    constexpr int ROUNDS = 12;
+    constexpr uint32_t CONTROL_OBJ = 0x524E5043u; // "RNPC", the persistent control, deleted at the end
+    // The chip is polled for its answer every 10 ms in normal use, which quantises every
+    // APDU to 10 ms and hides exactly the 1-3 ms this is after: 0.25 ms while measuring.
+    // And the bus at 400 kHz (the chip takes up to 1 MHz with clock stretching, which the
+    // RP2350 does) so the wire term shrinks to a quarter and an NVM write stands out of
+    // it. Both restored below, whatever happens.
+    pollIntervalUs = 250;
+    bus.setClock(400000);
+    uint32_t roundT[ROUNDS] = {}, roundP[ROUNDS] = {};
+    struct Stat {
+        uint32_t best = UINT32_MAX, worst = 0, total = 0;
+        int done = 0;
+        void add(uint32_t dt)
+        {
+            total += dt;
+            best = min(best, dt);
+            worst = max(worst, dt);
+            done++;
+        }
+        uint32_t avg() const { return done ? total / done : 0; }
+    } tBytes, tWriteT, tWriteP, tAgreeObj, tObjPath;
+
+    uint16_t sw = 0;
+    reverse(pubs[2], be, 32);
+    bool control = false;
+    if (ensureSession("benchmark")) {
+        // A persistent object under the same policy, created fresh so its attributes
+        // match the transient one's. Its initial value is pubs[2]; round 0 writes pubs[0].
+        if (objectExists(CONTROL_OBJ) == 1 && !deleteObject(CONTROL_OBJ, &sw))
+            LOG_WARN("SE050: benchmark: stale control object 0x%08x not deleted, SW=%04x", (unsigned)CONTROL_OBJ, sw);
+        control = peerKeyWrite(CONTROL_OBJ, be, true, false, &sw);
+        if (!control)
+            LOG_WARN("SE050: benchmark: persistent control object not created, SW=%04x - no write comparison", sw);
+    }
+    // The transient object starts the rounds holding pubs[2] as well.
+    if (!peerObjReady)
+        x25519EcdhObject(activeKeyObj, pubs[2], tmp);
+    else if (!peerKeyWrite(PEER_KEY_OBJ, be, false, true, &sw))
+        peerObjReady = false;
+
+    bool mismatch = false;
+    for (int i = 0; i < ROUNDS && peerObjReady; i++) {
+        // Written this round: pubs[i%3]. The end-to-end pass at the end writes pubs[(i+2)%3],
+        // so the next round's write differs from what the object holds, and so does this one.
+        const int k = i % 3, k2 = (i + 2) % 3;
+        reverse(pubs[k], be, 32);
+
+        uint32_t t0 = micros();
+        bool ok = x25519EcdhBytes(activeKeyObj, pubs[k], tmp);
+        uint32_t dt = micros() - t0;
+        if (!ok) {
+            LOG_WARN("SE050: benchmark aborted, byte-array ECDH failed in round %d", i + 1);
+            break;
+        }
+        tBytes.add(dt);
+        if (memcmp(tmp, softs[k], 32) != 0)
+            mismatch = true;
+
+        t0 = micros();
+        ok = peerKeyWrite(PEER_KEY_OBJ, be, false, true, &sw);
+        dt = micros() - t0;
+        if (!ok) {
+            LOG_WARN("SE050: benchmark aborted, transient WriteECKey SW=%04x in round %d", sw, i + 1);
+            break;
+        }
+        tWriteT.add(dt);
+        roundT[i] = dt;
+
+        if (control) {
+            t0 = micros();
+            ok = peerKeyWrite(CONTROL_OBJ, be, false, false, &sw);
+            dt = micros() - t0;
+            if (!ok) {
+                LOG_WARN("SE050: benchmark: persistent WriteECKey SW=%04x in round %d, control dropped", sw, i + 1);
+                control = false;
+            } else {
+                tWriteP.add(dt);
+                roundP[i] = dt;
+            }
+        }
+
+        // The agreement alone against the value just written: TAG_3, no key bytes on the wire.
+        uint8_t keyId[4], peerId[4];
+        be32(activeKeyObj, keyId);
+        be32(PEER_KEY_OBJ, peerId);
+        const uint8_t hDh[4] = {0x80, 0x03, 0x01, 0x0F};
+        const uint8_t dDh[12] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3], 0x43, 0x04, peerId[0], peerId[1], peerId[2], peerId[3]};
+        uint8_t r[128];
+        t0 = micros();
+        int rl = sessionApdu(hDh, dDh, sizeof(dDh), true, r, sizeof(r), &sw);
+        dt = micros() - t0;
+        int vl;
+        const uint8_t *v = tlv1(r, rl, &vl);
+        if (sw != 0x9000 || !v || vl != 32) {
+            LOG_WARN("SE050: benchmark aborted, ECDH via object SW=%04x in round %d", sw, i + 1);
+            break;
+        }
+        tAgreeObj.add(dt);
+        reverse(v, tmp, 32);
+        if (memcmp(tmp, softs[k], 32) != 0)
+            mismatch = true;
+
+        // End to end, as exchange() pays it: write + agree.
+        t0 = micros();
+        ok = x25519EcdhObject(activeKeyObj, pubs[k2], tmp);
+        dt = micros() - t0;
+        if (!ok) {
+            LOG_WARN("SE050: benchmark aborted, object path failed in round %d", i + 1);
+            break;
+        }
+        tObjPath.add(dt);
+        if (memcmp(tmp, softs[k2], 32) != 0)
+            mismatch = true;
+    }
+
+    // Two more controls, so "TAG_2 costs the wire more, nothing else" rests on measurements
+    // rather than on the byte count. (1) The wire itself: EdDSASign over 1 and 33 bytes
+    // is the same computation (one SHA-512 block either way) and exactly two AES blocks
+    // apart on the wire, like TAG_2 vs TAG_3. (2) An NVM write inside an agreement, if
+    // there is one to see: the same TAG_3 agreement against the persistent control
+    // object, byte for byte the transient one.
+    Stat tSign1, tSign33, tAgreePersist;
+    if (signingReady || ed25519Ensure(SIGNING_OBJ, tmp)) {
+        uint8_t msg[33], sig[64];
+        se050PortRandom(msg, sizeof(msg));
+        for (int i = 0; i < ROUNDS; i++) {
+            uint32_t t0 = micros();
+            bool ok = ed25519Sign(SIGNING_OBJ, msg, 1, sig);
+            uint32_t dt = micros() - t0;
+            if (!ok)
+                break;
+            tSign1.add(dt);
+            t0 = micros();
+            ok = ed25519Sign(SIGNING_OBJ, msg, 33, sig);
+            dt = micros() - t0;
+            if (!ok)
+                break;
+            tSign33.add(dt);
+        }
+    }
+    if (control) {
+        uint8_t keyId[4], ctlId[4];
+        be32(activeKeyObj, keyId);
+        be32(CONTROL_OBJ, ctlId);
+        const uint8_t hDh[4] = {0x80, 0x03, 0x01, 0x0F};
+        const uint8_t dDh[12] = {0x41, 0x04, keyId[0], keyId[1], keyId[2], keyId[3], 0x43, 0x04, ctlId[0], ctlId[1], ctlId[2], ctlId[3]};
+        for (int i = 0; i < ROUNDS; i++) {
+            const int k = i % 3;
+            reverse(pubs[k], be, 32);
+            if (!peerKeyWrite(CONTROL_OBJ, be, false, false, &sw))
+                break;
+            uint8_t r[128];
+            uint32_t t0 = micros();
+            int rl = sessionApdu(hDh, dDh, sizeof(dDh), true, r, sizeof(r), &sw);
+            uint32_t dt = micros() - t0;
+            int vl;
+            const uint8_t *v = tlv1(r, rl, &vl);
+            if (sw != 0x9000 || !v || vl != 32)
+                break;
+            tAgreePersist.add(dt);
+            reverse(v, tmp, 32);
+            if (memcmp(tmp, softs[k], 32) != 0)
+                mismatch = true;
+        }
+    }
+
+    if (control && !deleteObject(CONTROL_OBJ, &sw))
+        LOG_WARN("SE050: benchmark: control object 0x%08x not deleted, SW=%04x", (unsigned)CONTROL_OBJ, sw);
+    pollIntervalUs = POLL_INTERVAL_MS * 1000;
+    bus.setClock(100000);
+
+    // The software agreement, for scale.
+    uint8_t softShared[32], softPrv[32], softPub[32];
+    Curve25519::dh1(softPub, softPrv);
+    memcpy(softShared, ourPublic, 32);
+    uint32_t t0 = micros();
+    Curve25519::dh2(softShared, softPrv);
+    uint32_t softUs = micros() - t0;
+
+    // Tenths of a millisecond, the resolution that matters here.
+#define SE050_MS(us) (unsigned)((us) / 1000), (unsigned)(((us) / 100) % 10)
+    if (tBytes.done > 0)
+        LOG_INFO("SE050: bench (I2C 400 kHz, poll 0.25 ms) ECDH byte array (TAG_2): %d rounds, min %u.%u ms, avg %u.%u ms, max %u.%u ms | software %u ms", tBytes.done,
+                 SE050_MS(tBytes.best), SE050_MS(tBytes.avg()), SE050_MS(tBytes.worst), (unsigned)(softUs / 1000));
+    if (tAgreeObj.done > 0)
+        LOG_INFO("SE050: bench ECDH via object (TAG_3): %d rounds, min %u.%u ms, avg %u.%u ms, max %u.%u ms (two AES blocks fewer on the wire)",
+                 tAgreeObj.done, SE050_MS(tAgreeObj.best), SE050_MS(tAgreeObj.avg()), SE050_MS(tAgreeObj.worst));
+    if (tWriteT.done > 0)
+        LOG_INFO("SE050: bench WriteECKey transient: %d rounds, min %u.%u ms, avg %u.%u ms, max %u.%u ms", tWriteT.done,
+                 SE050_MS(tWriteT.best), SE050_MS(tWriteT.avg()), SE050_MS(tWriteT.worst));
+    {
+        // Round by round, so an outlier (a transient write that did pay the NVM price) shows.
+        char rounds[160];
+        int n = 0;
+        for (int i = 0; i < ROUNDS && n < (int)sizeof(rounds) - 24; i++)
+            n += snprintf(&rounds[n], sizeof(rounds) - n, " %u.%u/%u.%u", SE050_MS(roundT[i]), SE050_MS(roundP[i]));
+        LOG_INFO("SE050: bench write transient/persistent per round (ms):%s", rounds);
+    }
+    if (tWriteP.done > 0) {
+        int32_t delta = (int32_t)tWriteT.best - (int32_t)tWriteP.best;
+        uint32_t mag = (uint32_t)(delta < 0 ? -delta : delta);
+        LOG_INFO("SE050: bench WriteECKey persistent (same bytes, NVM for sure): %d rounds, min %u.%u ms, avg %u.%u ms, max %u.%u ms",
+                 tWriteP.done, SE050_MS(tWriteP.best), SE050_MS(tWriteP.avg()), SE050_MS(tWriteP.worst));
+        LOG_INFO("SE050: bench transient - persistent write = %s%u.%u ms (min vs min): %s", delta < 0 ? "-" : "+", SE050_MS(mag),
+                 delta <= -1500 ? "the transient write stays out of NVM" : "NO clear gap - the transient write costs what an NVM write costs");
+    }
+    if (tSign33.done > 0)
+        LOG_INFO("SE050: bench wire calibration, EdDSASign 33 B - 1 B (two AES blocks, same computation): min %u.%u - %u.%u = %u.%u ms",
+                 SE050_MS(tSign33.best), SE050_MS(tSign1.best), SE050_MS(tSign33.best - tSign1.best));
+    if (tAgreePersist.done > 0)
+        LOG_INFO("SE050: bench ECDH via the PERSISTENT object (same bytes as TAG_3 transient): %d rounds, min %u.%u ms, avg %u.%u ms, max %u.%u ms",
+                 tAgreePersist.done, SE050_MS(tAgreePersist.best), SE050_MS(tAgreePersist.avg()), SE050_MS(tAgreePersist.worst));
+    if (tObjPath.done > 0)
+        LOG_INFO("SE050: bench object path end to end (write + agree, what exchange() pays): %d rounds, min %u.%u ms, avg %u.%u ms, max %u.%u ms%s",
+                 tObjPath.done, SE050_MS(tObjPath.best), SE050_MS(tObjPath.avg()), SE050_MS(tObjPath.worst),
+                 mismatch ? " - SHARED SECRET MISMATCH in some round" : ", every round matched software");
+#undef SE050_MS
 }
 
 #endif // HAS_SE050

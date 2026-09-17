@@ -377,6 +377,10 @@ static void handleConsole()
             if (se050)
                 se050->benchScp03Kat();
             break;
+        case 'B': // where the NVM write is in an X25519 agreement, ~3 s (docs/se050_ecdh_nvm.md)
+            if (se050)
+                se050->benchEcdhNvm();
+            break;
 #ifdef SE050_ALLOW_ROTATION
         case 'D': // dry run: print the PUT KEY the rotation would send, without sending
             if (se050)

@@ -72,10 +72,32 @@ class SE050
     static constexpr uint32_t IDENTITY_OBJ = 0x4D544944u; // "MTID", X25519 (the Meshtastic port's identity)
     static constexpr uint32_t SIGNING_OBJ = 0x524E5353u;  // "RNSS", Ed25519
 
+    // Peer key object for the agreement. AN12543 4.10.3 says that on ID_ECC_MONT_DH_25519
+    // the chip writes NVM on every ECDHGenerateSharedSecret that takes the peer key as a
+    // byte array (TAG_2) and not when it takes it as the id of a transient ECPublicKey
+    // object (TAG_3); a transient object keeps its attributes in NVM (written once, on
+    // creation) and its value in RAM, cleared when the applet is deselected, which is fine
+    // because the value is rewritten before every agreement anyway. Measured on this
+    // SE050E2 / applet 7.2.0 (docs/se050_ecdh_nvm.md, 2026-09-17): the byte-array
+    // agreement shows NO NVM write - it costs 0.7 ms more than the object one where the two
+    // extra AES blocks on the wire alone cost 1.3 ms, while a real NVM write measures
+    // 1.6-2.3 ms in the same run - and the object path costs +30-36 ms per agreement. So
+    // the byte-array form is the default; the object form stays as the measured
+    // alternative (-D SE050_ECDH_VIA_OBJECT) and the benchmark as the way to re-check a
+    // chip whose applet differs.
+    static constexpr uint32_t PEER_KEY_OBJ = 0x524E504Bu; // "RNPK", X25519 public, transient
+
     // X25519 key pair at objId: read its public key, generating the pair if absent.
     bool x25519Ensure(uint32_t objId, uint8_t publicKey[32]);
-    // One key agreement with the private key at objId. AN12413 4.10.3: an NVM write per call.
+    // One key agreement with the private key at objId: the byte-array form, or the object
+    // form when built with SE050_ECDH_VIA_OBJECT - which drops back to bytes for the run
+    // (a WARN says so) if the chip refuses it while still answering the byte-array form,
+    // so a packet is never lost to the option. probe() re-arms it.
     bool x25519Ecdh(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32]);
+    // The two forms on their own: the peer key as a byte array (TAG_2) or via PEER_KEY_OBJ
+    // (TAG_3, WriteECKey first). Both verified against software by the benchmark.
+    bool x25519EcdhBytes(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32]);
+    bool x25519EcdhObject(uint32_t objId, const uint8_t peerPublic[32], uint8_t shared[32]);
     // Ed25519 key pair at objId: read its public key, generating the pair if absent.
     bool ed25519Ensure(uint32_t objId, uint8_t publicKey[32]);
     // EdDSA pure (RFC 8032) over message with the key at objId; the chip hashes the
@@ -123,6 +145,14 @@ class SE050
     // Bring-up check for all four layers.
     bool probe();
 
+    // The NVM-write measurement behind the x25519Ecdh default (docs/se050_ecdh_nvm.md): the
+    // two agreement forms, the transient and a persistent WriteECKey, and a wire
+    // calibration, 12 rounds each at 400 kHz I2C with 0.25 ms polling, both restored after.
+    // ~3 s, a handful of NVM writes (the persistent control object, created and deleted),
+    // and it creates PEER_KEY_OBJ on a chip without one. Console 'B'; at boot with
+    // -D SE050_BENCHMARK. Needs an open channel (probe() first).
+    void benchEcdhNvm();
+
     // Last resort for recover(): called when the chip does not answer the T=1
     // interface reset, i.e. it is wedged or unpowered. The board owns the ENA pin
     // (only some carriers have it wired), so it supplies the pulse; the driver
@@ -169,6 +199,9 @@ class SE050
     // flight and overwrite the buffers it is still using.
     bool waiting = false;
     bool reentered(const char *what);
+    // How often xfer asks the chip for its answer. 10 ms in normal use (every APDU is
+    // quantised to it); the benchmark drops it to 0.25 ms while it measures.
+    uint32_t pollIntervalUs = 10000;
 
     bool selectApplet();
 
@@ -185,6 +218,14 @@ class SE050
     int objectExists(uint32_t objId);
     // Shared body of x25519Ensure / ed25519Ensure: curve and policy are the only difference.
     bool keyEnsure(const char *what, uint32_t objId, uint8_t curve, const uint8_t policy[4], uint8_t publicKey[32]);
+    // WriteECKey of a MONT_DH_25519 public key (big-endian, the chip's order) into the
+    // ECPublicKey object at objId. Creating and updating are different APDUs - policy and
+    // curve are only accepted while the id is free (AN12543 4.7.1.1) - so the caller says
+    // which with `create`, and whether a new object is transient. The SW comes back for
+    // the caller to tell a refusal from a lost session.
+    bool peerKeyWrite(uint32_t objId, const uint8_t valueBe[32], bool create, bool transient, uint16_t *sw);
+    // DeleteSecureObject inside the session (the object's policy must carry ALLOW_DELETE).
+    bool deleteObject(uint32_t objId, uint16_t *sw);
 
     // Curve, authenticator and UserID session - the idempotent preamble both
     // identity paths need before they can touch a key object.
@@ -260,6 +301,18 @@ class SE050
     // Which key object identityEcdh works against: the chip-generated identity or
     // the mirrored node key, depending on which path prepared it.
     uint32_t activeKeyObj = 0;
+    // PEER_KEY_OBJ is known to exist (checked or created this run); cleared whenever an
+    // APDU against it fails, so the next agreement asks the chip again.
+    bool peerObjReady = false;
+    // x25519Ecdh's path. Bytes by default (measured, see PEER_KEY_OBJ); the object with
+    // SE050_ECDH_VIA_OBJECT, until the chip refuses it while still answering the
+    // byte-array form. probe() sets it back.
+#ifdef SE050_ECDH_VIA_OBJECT
+    static constexpr bool ECDH_VIA_OBJECT_DEFAULT = true;
+#else
+    static constexpr bool ECDH_VIA_OBJECT_DEFAULT = false;
+#endif
+    bool ecdhViaObject = ECDH_VIA_OBJECT_DEFAULT;
     bool signingReady = false;
     PowerCycleFn powerCycle = nullptr;
     uint8_t lastHostChallenge[8] = {};

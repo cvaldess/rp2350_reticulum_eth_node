@@ -34,8 +34,11 @@ class Se050ExchangeKey : public RNS::Cryptography::X25519PrivateKey
     {
     }
 
-    // One key agreement in the chip (64 ms measured; AN12413 4.10.3: an NVM write
-    // per call on this curve). Identity::decrypt is the only caller.
+    // One key agreement in the chip (66 ms measured). Identity::decrypt is the only
+    // caller: links use ephemeral software keys, announces sign. AN12543 4.10.3 says
+    // this form (peer key as bytes) writes NVM per call on this curve; measured on this
+    // chip it does not show one, so the driver keeps it and the transient-object form
+    // stays an option - docs/se050_ecdh_nvm.md.
     const RNS::Bytes exchange(const RNS::Bytes &peer_public_key) override
     {
         if (peer_public_key.size() != 32)
