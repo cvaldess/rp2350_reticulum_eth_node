@@ -30,11 +30,11 @@ static const char *KEY[F_COUNT] = {"announce_interval_s", "lora_tx_power_dbm", "
 static const char *TRIAL_KEY = "ip_trial_boots";
 static const char *TRIAL_REVERTED_KEY = "ip_trial_reverted";
 
-// Bounds. announce: below ~10 s a node would spend its duty cycle announcing; the upper end is a
-// day. tx power is at the antenna (LoRaInterface clamps what the SX1262 can actually do).
-static constexpr uint32_t ANNOUNCE_MIN = 10, ANNOUNCE_MAX = 86400;
-static constexpr int TXPOWER_MIN = -9, TXPOWER_MAX = 30;
-static constexpr uint32_t NTP_MIN = 60, NTP_MAX = 604800;
+// The bounds live in the header (NodeSettings::ANNOUNCE_MIN...) so the radio-side schema quotes
+// the same numbers.
+static constexpr uint32_t ANNOUNCE_MIN = NodeSettings::ANNOUNCE_MIN, ANNOUNCE_MAX = NodeSettings::ANNOUNCE_MAX;
+static constexpr int TXPOWER_MIN = NodeSettings::TXPOWER_MIN, TXPOWER_MAX = NodeSettings::TXPOWER_MAX;
+static constexpr uint32_t NTP_MIN = NodeSettings::NTP_MIN, NTP_MAX = NodeSettings::NTP_MAX;
 
 static bool validIpv4(const char *s)
 {
@@ -203,6 +203,7 @@ bool NodeSettings::reset()
     if (_applyTxPower)
         _applyTxPower(_loraTxPowerDbm);
     Serial.println("[settings] overrides dropped, compile-time defaults apply");
+    notifyChanged();
     return true;
 }
 
@@ -240,6 +241,7 @@ void NodeSettings::revertIpToDhcp(const char *why)
     _ipTrial = IpTrial::Reverted;
     _ipTrialBoots = 0;
     _ipTrialThisBoot = false;
+    notifyChanged();
 }
 
 void NodeSettings::confirmIp()
@@ -456,6 +458,7 @@ bool NodeSettings::applyJson(const char *json, char *err, size_t errCap, char *c
             snprintf(changed + strlen(changed), changedCap - strlen(changed), "%s%s", changed[0] ? "," : "", KEY[i]);
     Serial.printf("[settings] changed: %s%s%s\n", changed, _rebootPending ? " (reboot pending)" : "",
                   _ipTrial == IpTrial::Pending ? " (static ip on trial at the next boot)" : "");
+    notifyChanged();
     return true;
 }
 
@@ -534,7 +537,12 @@ static void handleReboot(EthernetClient &client, const HttpApi::Request &req)
         return;
     }
     HttpApi::reply(client, 200, "application/json", "{\"ok\":true,\"rebooting\":true}\n");
-    Serial.println("[api] reboot requested over HTTP");
+    nodeSettingsRequestReboot("HTTP");
+}
+
+void nodeSettingsRequestReboot(const char *why)
+{
+    Serial.printf("[api] reboot requested over %s\n", why);
     s_rebootAt = millis() + 500;
 }
 

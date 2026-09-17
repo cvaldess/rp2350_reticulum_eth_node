@@ -16,7 +16,8 @@ python tools/node_config.py --host 192.168.1.191 --reset                # back t
 python tools/node_config.py --host 192.168.1.191 --reboot               # apply a boot-only change
 ```
 
-The USB console prints the same thing with `c`.
+The USB console prints the same thing with `c`. A node without Ethernet gets the same settings
+over the radio: `docs/provisioning.md`.
 
 ## What is settable, and why these
 

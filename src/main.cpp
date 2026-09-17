@@ -15,6 +15,7 @@
 #include "EthernetLink.h"
 #include "LoRaInterface.h"
 #include "HttpApi.h"
+#include "NodeProvisioning.h"
 #include "NodeSettings.h"
 #include "Ntp.h"
 #include "Ota.h"
@@ -279,7 +280,11 @@ static bool reticulumSetup()
         reticulum.transport_enabled(true);
         reticulum.probe_destination_enabled(true);
         reticulum.remote_management_enabled(true);
+        // The settings over the radio (/provision on the remote management destination). Its
+        // namespace has to exist before the Provisioner starts, inside start().
+        nodeProvisioningRegister();
         reticulum.start();
+        nodeProvisioningSync(); // the Provisioner's mirror follows /node_settings, not the other way round
 
         // Clock, right after start() so no Transport state is timestamped in the old
         // timebase. Blocking here (at most REPLY_TIMEOUT_MS) is fine, the loop is not

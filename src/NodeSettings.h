@@ -28,10 +28,21 @@ class NodeSettings
 
     // Asked when rendering /config: where the running address came from (EthernetLink).
     using IpSourceFn = const char *(*)();
+    // Told after any change that landed (a PUT, a reset, the static-IP trial reverting), so a
+    // second view of these settings (the Provisioning namespace, NodeProvisioning.cpp) can
+    // follow without this class knowing it exists.
+    using ChangedFn = void (*)();
+
+    // Bounds. announce: below ~10 s a node would spend its duty cycle announcing; the upper end
+    // is a day. tx power is at the antenna (LoRaInterface clamps what the SX1262 can actually do).
+    static constexpr uint32_t ANNOUNCE_MIN = 10, ANNOUNCE_MAX = 86400;
+    static constexpr int TXPOWER_MIN = -9, TXPOWER_MAX = 30;
+    static constexpr uint32_t NTP_MIN = 60, NTP_MAX = 604800;
 
     void begin();
     void onTxPower(TxPowerApplier fn) { _applyTxPower = fn; }
     void onIpSource(IpSourceFn fn) { _ipSource = fn; }
+    void onChanged(ChangedFn fn) { _changed = fn; }
 
     uint32_t announceIntervalS() const { return _announceIntervalS; }
     int8_t loraTxPowerDbm() const { return _loraTxPowerDbm; }
@@ -40,6 +51,15 @@ class NodeSettings
     uint16_t tcpPort() const { return _tcpPort; }
     // True once a setting that only takes effect at boot has been changed.
     bool rebootPending() const { return _rebootPending; }
+    // The address fields as configured ("" = not set); staticAddress() below resolves them.
+    const char *ip() const { return _ip; }
+    const char *subnet() const { return _subnet; }
+    const char *gateway() const { return _gateway; }
+    const char *dns() const { return _dns; }
+    // Where the running address came from, as /config reports it ("none" before Ethernet is up).
+    const char *ipSourceName() const { return _ipSource ? _ipSource() : "none"; }
+    // The trial state by name, as /config reports it.
+    const char *ipTrialName() const { return ipTrialName(_ipTrial); }
 
     // Address configuration for EthernetLink::begin(). staticOnly = ip_mode is static. hasStatic
     // = an `ip` is set; subnet/gateway/dns fall back to /24, the .1 of that subnet and the gateway.
@@ -85,6 +105,12 @@ class NodeSettings
     bool _rebootPending = false;
     TxPowerApplier _applyTxPower = nullptr;
     IpSourceFn _ipSource = nullptr;
+    ChangedFn _changed = nullptr;
+    void notifyChanged()
+    {
+        if (_changed)
+            _changed();
+    }
 
     IpTrial _ipTrial = IpTrial::None;
     uint32_t _ipTrialBoots = 0; // unconfirmed boots of the static address, this one included
@@ -95,6 +121,8 @@ extern NodeSettings settings;
 
 // Registers /config, /config/reset and /reboot on the shared HTTP API.
 void nodeSettingsRegisterRoutes();
-// Carries out a reboot asked for over HTTP, once the reply has gone out, and times out the
-// static-IP trial. Call from loop().
+// Carries out a reboot asked for over HTTP or by radio, once the reply has gone out, and times
+// out the static-IP trial. Call from loop().
 void nodeSettingsLoop();
+// Reboot in half a second, after the current reply has gone out. why is for the log.
+void nodeSettingsRequestReboot(const char *why);
