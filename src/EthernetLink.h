@@ -18,6 +18,9 @@
 class EthernetLink
 {
   public:
+    // The watchdog is disabled across setup() (main.cpp), so this blocking call is not bound by the
+    // watchdog window; ~6-7 s is a normal cold-boot lease on this network. If no lease comes the
+    // static fallback (when set) takes over.
     static constexpr uint32_t DHCP_TIMEOUT_MS = 10000;
     static constexpr uint32_t DHCP_RETRY_TIMEOUT_MS = 4000;
     static constexpr uint32_t DHCP_RETRY_INTERVAL_MS = 30000;

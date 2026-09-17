@@ -5,6 +5,7 @@
 #include <PicoOTA.h>
 #include <SHA256.h>
 #include <hardware/regs/addressmap.h>
+#include <hardware/watchdog.h>
 #include <string.h>
 
 Ota ota;
@@ -215,6 +216,7 @@ bool Ota::receiveBody(EthernetClient &client, size_t size, const uint8_t expectS
     uint8_t head[2] = {0, 0};
     uint8_t tail[4] = {0, 0, 0, 0};
     while (got < size) {
+        watchdog_update(); // the whole upload runs inside one loop() pass; keep the watchdog fed
         int n = client.available();
         if (n <= 0) {
             if (!client.connected() || millis() - lastData > BODY_IDLE_TIMEOUT_MS) {

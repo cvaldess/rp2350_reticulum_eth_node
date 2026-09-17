@@ -18,6 +18,17 @@
 #include "NodeSettings.h"
 #include "Ntp.h"
 #include "Ota.h"
+
+// The RP2350 hardware watchdog. A trip survives the reset it causes and keeps counting through the
+// next setup(), so each long blocking call in setup() is fed first (a no-op on a clean boot, the
+// reboot-loop breaker after a trip); it is armed at the end of setup() and loop() feeds it. This is
+// the Meshtastic rp2xx0 pattern (feed-before-blocking + arm + feed-in-loop).
+#ifdef ARCH_RP2040
+#include <hardware/watchdog.h>
+#define FEED_WDT() rp2040.wdt_reset()
+#else
+#define FEED_WDT() ((void)0)
+#endif
 #include "PicoLittleFSFileSystem.h"
 #include "Rp2350Trng.h"
 #include "TCPClientInterface.h"
@@ -131,6 +142,34 @@ static void printHeap(const char *tag)
     Serial.printf("[%s] heap total=%d free=%d\n", tag, rp2040.getTotalHeap(), rp2040.getFreeHeap());
 }
 
+// A last-resort reboot if the free heap stays below the floor for long enough. A hang is the
+// watchdog's job; this is for the other 24x7 failure, a slow leak that would otherwise end in
+// failed allocations and half-working state. The dip has to be sustained (NODE_LOW_HEAP_HOLD_MS)
+// so a transient allocation (an OTA upload, a burst of packets) is not mistaken for a leak. The
+// reboot goes through the normal path, so an OTA image that leaks fails its trial and rolls back.
+static void checkLowHeap()
+{
+#if NODE_LOW_HEAP_REBOOT_BYTES > 0
+    static uint32_t lowSince = 0;
+    uint32_t freeHeap = rp2040.getFreeHeap();
+    if (freeHeap >= NODE_LOW_HEAP_REBOOT_BYTES) {
+        lowSince = 0;
+        return;
+    }
+    uint32_t now = millis();
+    if (lowSince == 0) {
+        lowSince = now ? now : 1;
+        Serial.printf("[mem] free heap %lu below %d, watching\n", (unsigned long)freeHeap,
+                      NODE_LOW_HEAP_REBOOT_BYTES);
+    } else if (now - lowSince >= NODE_LOW_HEAP_HOLD_MS) {
+        Serial.printf("[mem] free heap %lu below %d for %d ms, rebooting\n", (unsigned long)freeHeap,
+                      NODE_LOW_HEAP_REBOOT_BYTES, NODE_LOW_HEAP_HOLD_MS);
+        Serial.flush();
+        rp2040.reboot();
+    }
+#endif
+}
+
 static IPAddress parseIp(const char *s)
 {
     IPAddress ip;
@@ -238,6 +277,7 @@ static bool reticulumSetup()
         // Clock, right after start() so no Transport state is timestamped in the old
         // timebase. Blocking here (at most REPLY_TIMEOUT_MS) is fine, the loop is not
         // running yet; afterwards clockLoop() keeps it in step without blocking.
+        FEED_WDT(); // the NTP request blocks up to Ntp::REPLY_TIMEOUT_MS
         if (eth.hasIp() && ntp.request()) {
             lastClockSync = millis();
             uint64_t unixMs = 0;
@@ -427,6 +467,7 @@ void setup()
     Serial.println();
     Serial.println("rp2350_reticulum_eth_node phase 4 (Ethernet OTA + config API)");
     printHeap("boot");
+    FEED_WDT(); // a watchdog left armed by a previous trip is already ticking through this setup()
 
     // Before anything that could fail: this is where a trial boot is counted and, if it is
     // one too many, where the previous image is put back.
@@ -438,13 +479,16 @@ void setup()
         EthernetLink::Address addr;
         addr.staticOnly = settings.ipStaticOnly();
         addr.hasStatic = settings.staticAddress(addr.ip, addr.subnet, addr.gateway, addr.dns);
+        FEED_WDT(); // DHCP blocks in one call; start it with the whole window
         eth.begin(addr);
     }
     settings.onIpSource([]() { return EthernetLink::sourceName(eth.source()); });
+    FEED_WDT();
     se050Setup();
 
     RNS::loglevel(RNS::LOG_DEBUG);
 
+    FEED_WDT();
     if (!reticulumSetup()) {
         // Blink fast forever: something below Reticulum is broken.
         for (;;) {
@@ -460,11 +504,25 @@ void setup()
 
     Serial.printf("transport identity: %s\n", RNS::Transport::identity().hexhash().c_str());
     printHeap("after start");
+
+    // Bring-up is done: arm the watchdog. From here loop() has to feed it, so a hang below
+    // Reticulum, a wedged SPI transaction or a stuck interface reboots the node instead of
+    // leaving it dark in the switch. NODE_WATCHDOG_TIMEOUT_MS=0 disables it (bench).
+#ifdef ARCH_RP2040
+    if (NODE_WATCHDOG_TIMEOUT_MS > 0) {
+        rp2040.wdt_begin(NODE_WATCHDOG_TIMEOUT_MS);
+        Serial.printf("[wdt] armed, %d ms\n", NODE_WATCHDOG_TIMEOUT_MS);
+    } else {
+        Serial.println("[wdt] disabled (see node_config.h)");
+    }
+#endif
     announcePending = true;
 }
 
 void loop()
 {
+    FEED_WDT();
+    checkLowHeap();
     eth.loop();
     reticulum.loop();
     handleConsole();
