@@ -10,10 +10,9 @@
 #include <Arduino.h>
 #include <Curve25519.h>
 #include <Ed25519.h>
-#ifdef SE050_ROTATED
 #include <SHA256.h>
-#endif
 #include <string.h>
+#include "../OtpVault.h"
 
 SE050 *se050 = nullptr;
 
@@ -397,25 +396,42 @@ bool SE050::initializeUpdate(const uint8_t hostChallenge[8], uint8_t cardChallen
     return true;
 }
 
+const char *SE050::keySourceName(KeySource s)
+{
+    switch (s) {
+    case KeySource::Otp:
+        return "OTP-derived";
+    case KeySource::Bench:
+        return "bench-master";
+    default:
+        return "factory";
+    }
+}
+
 bool SE050::openSecureChannel()
 {
-    // Virgin chips still hold the factory keys; a rotated one only answers to the per-device
-    // keys. Try factory first (the common case and the pre-rotation state), and only when the
-    // chip rejects them derive the rotated keys and try those, so a rotated chip reopens on
-    // every boot without any persisted flag.
-    usingRotatedKeys = false;
-    if (tryOpenChannel())
-        return true;
-#ifdef SE050_ROTATED
-    LOG_INFO("SE050: factory keys did not open the channel, trying the per-device rotated keys");
-    deriveRotatedKeys(curEnc, curMac, curDek);
-    usingRotatedKeys = true;
-    if (tryOpenChannel()) {
-        LOG_INFO("SE050: channel open with the rotated keys");
-        return true;
+    // The chip only answers to one static key set and there is no persisted flag saying
+    // which: try them most-likely first. A provisioned board runs the OTP-derived keys; a
+    // bench build may still carry the compile-time master (SE050_ROTATED); a virgin chip
+    // holds NXP's factory keys. A miss costs one INITIALIZE UPDATE.
+    static const KeySource order[] = {KeySource::Otp, KeySource::Bench, KeySource::Factory};
+    for (KeySource src : order) {
+        if (src == KeySource::Factory) {
+            usingRotatedKeys = false;
+        } else {
+            if (!deriveKeys(src, curEnc, curMac, curDek))
+                continue;
+            usingRotatedKeys = true;
+        }
+        keySource = src;
+        if (tryOpenChannel()) {
+            if (src != KeySource::Factory)
+                LOG_INFO("SE050: channel open with the %s keys", keySourceName(src));
+            return true;
+        }
     }
+    keySource = KeySource::Factory;
     usingRotatedKeys = false;
-#endif
     return false;
 }
 
@@ -455,7 +471,7 @@ bool SE050::tryOpenChannel()
     if (memcmp(expected, cardCryptogram, 8) != 0) {
         // Wrong key set for this chip (the usual reason a rotated chip rejects the factory
         // keys), or a broken KDF. openSecureChannel() may retry with the other key set.
-        LOG_INFO("SE050: card cryptogram mismatch with the %s keys", usingRotatedKeys ? "rotated" : "factory");
+        LOG_INFO("SE050: card cryptogram mismatch with the %s keys", keySourceName(keySource));
         return false;
     }
 
@@ -1266,13 +1282,14 @@ void SE050::benchScp03Kat()
     benchHex("cardCryptogram", lastCardCryptogram, 8);
 }
 
-#ifdef SE050_ROTATED
 // --- Per-device Platform SCP03 keys ----------------------------------------------
 //
-// Derivation and use of the rotated keys. Compiled on any board that talks to a rotated
-// chip; the one-way send that puts them there is separate, under SE050_ALLOW_ROTATION.
-// The framing matches NXP's own demo byte for byte (se05x_RotatePlatformSCP03Keys/
-// se05x_TP_PlatformSCP03keys.c, createKeyData), cross-checked against tools/scp03_rotate.py.
+// key_i = SHA256(master || label)[:16], labels SCP03-ENC/MAC/DEK. The master is the 32-byte
+// seed in this board's OTP (OtpVault, docs/secure_boot.md); a bench build may also carry the
+// compile-time placeholder (SE050_ROTATED, se050_port.h). The one-way send that puts the keys
+// in the chip is separate, under SE050_ALLOW_ROTATION. The framing matches NXP's own demo byte
+// for byte (se05x_RotatePlatformSCP03Keys/se05x_TP_PlatformSCP03keys.c, createKeyData),
+// cross-checked against tools/scp03_rotate.py.
 
 static void deriveOne(const uint8_t *master, size_t mlen, const char *label, uint8_t out[16])
 {
@@ -1285,14 +1302,73 @@ static void deriveOne(const uint8_t *master, size_t mlen, const char *label, uin
     memcpy(out, full, 16);
 }
 
-void SE050::deriveRotatedKeys(uint8_t enc[16], uint8_t mac[16], uint8_t dek[16])
+static void deriveThree(const uint8_t *master, size_t mlen, uint8_t enc[16], uint8_t mac[16], uint8_t dek[16])
 {
-    static const uint8_t master[] = SE050_ROTATION_MASTER;
-    deriveOne(master, sizeof(master), "SCP03-ENC", enc);
-    deriveOne(master, sizeof(master), "SCP03-MAC", mac);
-    deriveOne(master, sizeof(master), "SCP03-DEK", dek);
+    deriveOne(master, mlen, "SCP03-ENC", enc);
+    deriveOne(master, mlen, "SCP03-MAC", mac);
+    deriveOne(master, mlen, "SCP03-DEK", dek);
 }
-#endif // SE050_ROTATED
+
+// The OTP-derived keys, read once per boot: the seed is derived from and wiped, and its page
+// soft-locked for everyone until the next reset. A blank page is left alone (not locked) so a
+// provisioning build can still write it.
+static uint8_t otpEnc[16], otpMac[16], otpDek[16];
+static enum { OTP_UNTRIED, OTP_PRESENT, OTP_ABSENT } otpKeys = OTP_UNTRIED;
+
+void SE050::forgetOtpKeys()
+{
+    otpKeys = OTP_UNTRIED;
+}
+
+bool SE050::deriveKeys(KeySource src, uint8_t enc[16], uint8_t mac[16], uint8_t dek[16])
+{
+    switch (src) {
+    case KeySource::Otp: {
+        if (otpKeys == OTP_UNTRIED) {
+            uint8_t seed[32];
+            OtpVault::SeedState st = OtpVault::readSeed(seed);
+            if (st == OtpVault::SeedState::Present) {
+                deriveThree(seed, sizeof(seed), otpEnc, otpMac, otpDek);
+                otpKeys = OTP_PRESENT;
+#ifdef NODE_OTP_PROVISION
+                // The lock word can only be written while the page is still Secure read-write:
+                // a provisioning build leaves the soft lock to Ow until Ol! has been run.
+                if (OtpVault::seedPageHardLocked()) {
+                    OtpVault::softLockSeedPage();
+                    LOG_INFO("SE050: per-device keys derived from the OTP seed, seed page soft-locked");
+                } else {
+                    LOG_WARN("SE050: keys derived from the OTP seed; page NOT soft-locked (hard-lock it: Ol!, then Ow)");
+                }
+#else
+                OtpVault::softLockSeedPage();
+                LOG_INFO("SE050: per-device keys derived from the OTP seed, seed page soft-locked");
+#endif
+            } else {
+                otpKeys = OTP_ABSENT;
+                LOG_INFO("SE050: OTP seed %s, no OTP-derived keys", OtpVault::seedStateName(st));
+            }
+            memset(seed, 0, sizeof(seed));
+        }
+        if (otpKeys != OTP_PRESENT)
+            return false;
+        memcpy(enc, otpEnc, 16);
+        memcpy(mac, otpMac, 16);
+        memcpy(dek, otpDek, 16);
+        return true;
+    }
+    case KeySource::Bench: {
+#ifdef SE050_ROTATED
+        static const uint8_t master[] = SE050_ROTATION_MASTER;
+        deriveThree(master, sizeof(master), enc, mac, dek);
+        return true;
+#else
+        return false;
+#endif
+    }
+    default:
+        return false;
+    }
+}
 
 #ifdef SE050_ALLOW_ROTATION
 // --- The one-way send (PUT KEY). Bench only, -D SE050_ALLOW_ROTATION. -------------
@@ -1303,7 +1379,8 @@ int SE050::buildPutKeyData(uint8_t *data, uint8_t *expected)
     const uint8_t *dekNow = usingRotatedKeys ? curDek : SCP_KEY_DEK;
 
     uint8_t nEnc[16], nMac[16], nDek[16];
-    deriveRotatedKeys(nEnc, nMac, nDek);
+    if (!deriveKeys(KeySource::Otp, nEnc, nMac, nDek))
+        return 0;
     const uint8_t *newKeys[3] = {nEnc, nMac, nDek};
 
     uint8_t zero[16] = {};
@@ -1334,34 +1411,45 @@ int SE050::buildPutKeyData(uint8_t *data, uint8_t *expected)
 void SE050::dryRunRotation()
 {
     uint8_t nEnc[16], nMac[16], nDek[16];
-    deriveRotatedKeys(nEnc, nMac, nDek);
-    Serial.println("[se050] rotation DRY RUN (nothing is sent):");
-    benchHex("new ENC", nEnc, 16);
-    benchHex("new MAC", nMac, 16);
-    benchHex("new DEK", nDek, 16);
-
+    if (!deriveKeys(KeySource::Otp, nEnc, nMac, nDek)) {
+        Serial.println("[se050] rotation DRY RUN: no OTP seed on this board, nothing to derive (console O s)");
+        return;
+    }
+    // The new keys derive from the OTP seed and never leave the board: only the framing and
+    // the KCVs (3 bytes per key, what the chip echoes) are printed, not the keys or the PUT
+    // KEY data (which is the keys under the current DEK, and a bench DEK is known to the PC).
+    memset(nEnc, 0, 16);
+    memset(nMac, 0, 16);
+    memset(nDek, 0, 16);
+    Serial.printf("[se050] rotation DRY RUN (nothing is sent), current keys: %s -> new keys: OTP-derived\n",
+                  keySourceName(keySource));
     uint8_t data[128], expected[16];
     int len = buildPutKeyData(data, expected);
+    memset(data, 0, sizeof(data));
     const uint8_t hdr[4] = {0x80, 0xD8, SCP03_KEYVER, 0x81};
     benchHex("APDU header (->0x84 wrapped)", hdr, 4);
-    Serial.printf("  Lc = %d\n", len);
-    benchHex("PUT KEY data", data, len);
+    Serial.printf("  Lc = %d (3 AES-128 components, NXP createKeyData layout)\n", len);
     benchHex("expected response (KVN+3 KCV)", expected, 10);
-    Serial.println("  compare with: tools/scp03_rotate.py plan <ENC> <MAC> <DEK>");
 }
 
 bool SE050::rotatePlatformKeys()
 {
-    if (usingRotatedKeys) {
-        LOG_WARN("SE050: this chip already runs rotated keys, nothing to do");
+    if (keySource == KeySource::Otp) {
+        LOG_WARN("SE050: this chip already runs the OTP-derived keys, nothing to do");
         return true;
+    }
+    uint8_t nEnc[16], nMac[16], nDek[16];
+    if (!deriveKeys(KeySource::Otp, nEnc, nMac, nDek)) {
+        LOG_ERROR("SE050: no OTP seed on this board (console O s first), not rotating");
+        return false;
     }
 
     // PUT KEY targets the security domain that owns the Platform SCP keys, not the IoT applet
     // (with the applet selected it returned 6a80; with nothing selected INITIALIZE UPDATE
     // returned 6a88). NXP's middleware selects the SSD for rotation (sm_const.h SSD_NAME =
     // D276000085304A434F9003, "Rotate keys ... Select SSD" in sm_connect.c). So: interface
-    // reset, SELECT that SSD, then open Platform SCP there and send PUT KEY.
+    // reset, SELECT that SSD, then open Platform SCP there (with whichever current keys the
+    // chip answers to: factory or the bench master) and send PUT KEY.
     scp.open = sessionActive = false;
     usingRotatedKeys = false;
     if (!reset()) {
@@ -1384,11 +1472,14 @@ bool SE050::rotatePlatformKeys()
         LOG_ERROR("SE050: cannot open a Platform SCP channel on the SSD, not rotating");
         return false;
     }
+    if (keySource == KeySource::Otp) {
+        LOG_WARN("SE050: the SSD already opens with the OTP-derived keys, nothing to do");
+        return true;
+    }
+    LOG_INFO("SE050: SSD channel open with the %s keys", keySourceName(keySource));
 
     uint8_t data[128], expected[16];
-    int len = buildPutKeyData(data, expected);
-    uint8_t nEnc[16], nMac[16], nDek[16];
-    deriveRotatedKeys(nEnc, nMac, nDek); // same derivation buildPutKeyData used
+    int len = buildPutKeyData(data, expected); // derives the same OTP keys as nEnc/nMac/nDek
 
     LOG_WARN("SE050: sending PUT KEY - this is irreversible");
     const uint8_t hdr[4] = {0x80, 0xD8, SCP03_KEYVER, 0x81};
@@ -1411,6 +1502,7 @@ bool SE050::rotatePlatformKeys()
     memcpy(curMac, nMac, 16);
     memcpy(curDek, nDek, 16);
     usingRotatedKeys = true;
+    keySource = KeySource::Otp;
     scp.open = sessionActive = false;
     if (!open() || !tryOpenChannel()) {
         LOG_ERROR("SE050: CANNOT reopen with the new keys - rotation is bad, chip may be lost");
@@ -1420,11 +1512,11 @@ bool SE050::rotatePlatformKeys()
     if (!identityEnsure(pub))
         LOG_WARN("SE050: channel reopened but the identity is not reachable - check the chip");
 
-    Serial.println("[se050] rotation CONFIRMED - channel reopens with the per-device keys:");
-    benchHex("new ENC", nEnc, 16);
-    benchHex("new MAC", nMac, 16);
-    benchHex("new DEK", nDek, 16);
-    Serial.println("  (reproducible from SE050_ROTATION_MASTER; the chip now rejects the factory keys)");
+    Serial.println("[se050] rotation CONFIRMED - channel reopens with the OTP-derived keys");
+    Serial.println("  (the chip now answers only to keys derived from this board's OTP seed)");
+    memset(nEnc, 0, 16);
+    memset(nMac, 0, 16);
+    memset(nDek, 0, 16);
     return true;
 }
 #endif // SE050_ALLOW_ROTATION

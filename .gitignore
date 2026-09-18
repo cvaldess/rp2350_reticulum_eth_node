@@ -7,6 +7,11 @@
 Thumbs.db
 bench/logs/
 include/build_id.h
+# Vendor datasheets (RP2350: 7.7 MB, CC BY-ND; keep it local)
+docs/*.pdf
+# Boot signing keys never enter the repo (docs/secure_boot.md); only include/boot_pubkeys.h does
+*.pem
+*.otp.json
 
 # NXP Plug&Trust MW (114 MB, not ours to redistribute)
 se05x_mw_v04.08.01.zip

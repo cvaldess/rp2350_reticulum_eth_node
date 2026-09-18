@@ -10,7 +10,13 @@ SHA-256(nonce || PSK). The board name comes from the UF2's path (.pio/build/<env
 --board says otherwise; the node refuses an image built for the other carrier.
 
 The PSK is read from include/node_config.h (NODE_API_PSK_HEX) unless --psk is given.
-Only the standard library is needed.
+
+Secure boot (docs/secure_boot.md): the image must carry the signed IMAGE_DEF the RP2350 bootrom
+checks (tools/seal.py adds it at build time), verified here exactly as the bootrom would, and the
+gzip body is signed with the same key (X-OTA-Sig, ECDSA secp256k1 over its SHA-256) so the node
+can refuse an upload nobody with the key approved. --allow-unsigned skips both, for a board that
+has not been secured yet and a firmware built with -D NODE_OTA_ALLOW_UNSIGNED.
+Needs the `ecdsa` package for the signatures; everything else is the standard library.
 """
 import argparse
 import gzip
@@ -22,6 +28,9 @@ import re
 import struct
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import picobin  # noqa: E402
 
 UF2_MAGIC0, UF2_MAGIC1, UF2_MAGIC_END = 0x0A324655, 0x9E5D5157, 0x0AB16F30
 UF2_NOT_MAIN_FLASH = 0x00000001
@@ -113,6 +122,50 @@ def auth_headers(nonce, psk):
     return {"X-Auth-Nonce": nonce, "X-Auth": auth, "X-OTA-Nonce": nonce, "X-OTA-Auth": auth}
 
 
+def default_sign_key():
+    keys_dir = os.environ.get("NODE_KEYS_DIR") or os.path.join(os.path.expanduser("~"), ".rp2350-keys")
+    return os.environ.get("NODE_SIGN_KEY") or os.path.join(keys_dir, "bootkey0.pem")
+
+
+def check_sealed(image, allow_unsigned):
+    """The bootrom's own check, before anything is sent: a secured node cannot roll back an image
+    that never boots. Returns the signing pubkey, or None when the image is unsigned and allowed."""
+    ok, detail, pub = picobin.verify(image)
+    if ok:
+        known = picobin.known_pubkeys()
+        if known and pub not in known:
+            raise SystemExit("image is signed with a key that is not in include/boot_pubkeys.h")
+        print("image: %s, key %s..." % (detail, picobin.bootkey_fingerprint(pub).hex()[:16]))
+        return pub
+    if not allow_unsigned:
+        raise SystemExit("image is not sealed (%s); build with the signing key, or --allow-unsigned "
+                         "for a board without secure boot" % detail)
+    print("image: UNSIGNED (%s) — only a board without secure boot will run it" % detail)
+    return None
+
+
+def sign_body(body, key_path, allow_unsigned):
+    """X-OTA-Sig: ECDSA secp256k1 (r||s, hex) over SHA-256(gzip body), deterministic (RFC 6979)."""
+    if not os.path.isfile(key_path):
+        if allow_unsigned:
+            print("upload: no signing key at %s, sending without X-OTA-Sig" % key_path)
+            return None
+        raise SystemExit("no signing key at %s (NODE_SIGN_KEY / --sign-key); --allow-unsigned to skip" % key_path)
+    from ecdsa import SECP256k1, SigningKey
+    from ecdsa.util import sigencode_string
+    with open(key_path, "rb") as f:
+        sk = SigningKey.from_pem(f.read())
+    if sk.curve != SECP256k1:
+        raise SystemExit("%s is not a secp256k1 key" % key_path)
+    pub = sk.get_verifying_key().to_string()
+    known = picobin.known_pubkeys()
+    if known and pub not in known:
+        raise SystemExit("%s is not one of the keys in include/boot_pubkeys.h; the node would refuse it" % key_path)
+    sig = sk.sign_digest_deterministic(hashlib.sha256(body).digest(), hashfunc=hashlib.sha256,
+                                       sigencode=sigencode_string)
+    return sig.hex()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("firmware", nargs="?", help="firmware.uf2 (or raw .bin) to upload")
@@ -120,6 +173,9 @@ def main():
     ap.add_argument("--port", type=int, default=4244)
     ap.add_argument("--board", help="env name the node must match (default: from the UF2 path)")
     ap.add_argument("--psk", help="64 hex chars (default: NODE_API_PSK_HEX from include/node_config.h)")
+    ap.add_argument("--sign-key", default=default_sign_key(), help="PEM that signs the upload (default: %(default)s)")
+    ap.add_argument("--allow-unsigned", action="store_true",
+                    help="push an unsealed image and/or skip X-OTA-Sig (board without secure boot only)")
     ap.add_argument("--status", action="store_true", help="just print /ota/status and exit")
     ap.add_argument("--wait", type=int, nargs="?", const=180, metavar="SECONDS",
                     help="after the upload, poll /ota/status until the new build is confirmed")
@@ -135,14 +191,21 @@ def main():
     psk = bytes.fromhex(args.psk or psk_from_config())
 
     image = load_image(args.firmware)
+    sealed_with = check_sealed(image, args.allow_unsigned)
     body = gzip.compress(image, compresslevel=9, mtime=0)
     sha = hashlib.sha256(body).hexdigest()
+    sig = sign_body(body, args.sign_key, args.allow_unsigned)
     print("image %d bytes, gzip %d bytes, sha256 %s, board %s" % (len(image), len(body), sha, board))
 
     before = status(args.host, args.port)
-    print("node: build '%s' state %s" % (before.get("build"), before.get("state")))
+    print("node: build '%s' state %s%s" % (before.get("build"), before.get("state"),
+                                            ", SECURE BOOT ON" if before.get("secure_boot") else ""))
     if before.get("board") != board:
         raise SystemExit("node says it is %s, refusing to push a %s image" % (before.get("board"), board))
+    # --allow-unsigned is for a board that has not been secured; on one that has, an unsealed
+    # image is a brick until somebody drags a signed UF2 onto it in BOOTSEL.
+    if before.get("secure_boot") and (sealed_with is None or sig is None):
+        raise SystemExit("the node has secure boot enabled: only a sealed, signed upload can boot there")
     if len(image) > before.get("image_max", 0):
         raise SystemExit("image (%d) larger than the node's sketch area (%d)" % (len(image), before["image_max"]))
 
@@ -152,6 +215,8 @@ def main():
         "X-OTA-SHA256": sha,
         "X-OTA-Board": board,
     }
+    if sig:
+        headers["X-OTA-Sig"] = sig
     headers.update(auth_headers(get_nonce(args.host, args.port), psk))
 
     t0 = time.time()

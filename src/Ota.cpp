@@ -1,5 +1,8 @@
 #include "Ota.h"
 
+#include "OtpVault.h"
+#include "Picobin.h"
+#include "boot_pubkeys.h"
 #include "build_id.h"
 #include <LittleFS.h>
 #include <PicoOTA.h>
@@ -7,6 +10,7 @@
 #include <hardware/regs/addressmap.h>
 #include <hardware/watchdog.h>
 #include <string.h>
+#include <uECC.h>
 
 Ota ota;
 
@@ -31,6 +35,27 @@ static uint64_t fsFree()
     if (!LittleFS.info(info))
         return 0;
     return info.totalBytes > info.usedBytes ? info.totalBytes - info.usedBytes : 0;
+}
+
+// Which of the boot signing keys signed this digest, -1 if none did.
+static int verifySignature(const uint8_t digest[32], const uint8_t sig[64])
+{
+    for (int k = 0; k < NODE_BOOT_PUBKEY_COUNT; k++)
+        if (uECC_verify(NODE_BOOT_PUBKEYS[k], digest, 32, sig, uECC_secp256k1()))
+            return k;
+    return -1;
+}
+
+// The running image's own signature block, as the bootrom sees it at XIP_BASE.
+static const Picobin::Signed &runningImage()
+{
+    static Picobin::Signed sig;
+    static bool done = false;
+    if (!done) {
+        Picobin::inspect((const uint8_t *)XIP_BASE, sketchArea(), sig);
+        done = true;
+    }
+    return sig;
 }
 
 const char *Ota::stateName(State s)
@@ -166,6 +191,12 @@ void Ota::status(Print &out) const
     out.printf("[ota] build %s board %s state %s image %s boots %lu uptime %lu s fs free %llu image max %lu\n",
                BUILD_STAMP, NODE_BOARD_ID, stateName(_state), _sha[0] ? _sha : "-", (unsigned long)_boots,
                (unsigned long)(millis() / 1000), (unsigned long long)fsFree(), (unsigned long)sketchArea());
+    const Picobin::Signed &img = runningImage();
+    if (img.blockAddr)
+        out.printf("[ota] running image signed: version %u.%u, key %d (%s), block 0x%08lx\n", img.major, img.minor,
+                   img.keyIndex, img.keyIndex >= 0 ? "ours" : "NOT ours", (unsigned long)img.blockAddr);
+    else
+        out.println("[ota] running image is NOT signed");
 }
 
 // ------------------------------------------------------------------------------------ loop
@@ -188,20 +219,28 @@ void Ota::loop()
 
 void Ota::handleStatus(EthernetClient &client)
 {
-    char body[320];
+    const Picobin::Signed &img = runningImage();
+    OtpVault::Status otp;
+    OtpVault::status(otp);
+    char body[440];
     snprintf(body, sizeof(body),
              "{\"board\":\"%s\",\"build\":\"%s\",\"state\":\"%s\",\"sha256\":\"%s\",\"boots\":%lu,"
-             "\"uptime_s\":%lu,\"fs_free\":%llu,\"image_max\":%lu}\n",
+             "\"uptime_s\":%lu,\"fs_free\":%llu,\"image_max\":%lu,\"signed\":%s,\"version\":\"%u.%u\","
+             "\"key\":%d,\"secure_boot\":%s,\"debug_disabled\":%s,\"chip_rev\":\"A%u\"}\n",
              NODE_BOARD_ID, BUILD_STAMP, stateName(_state), _sha, (unsigned long)_boots,
-             (unsigned long)(millis() / 1000), (unsigned long long)fsFree(), (unsigned long)sketchArea());
+             (unsigned long)(millis() / 1000), (unsigned long long)fsFree(), (unsigned long)sketchArea(),
+             img.blockAddr ? "true" : "false", img.major, img.minor, img.keyIndex, otp.secureBoot ? "true" : "false",
+             otp.debugDisabled ? "true" : "false", otp.chipRevision);
     HttpApi::reply(client, 200, "application/json", body);
 }
 
 // Streams the body into IMAGE_FILE while hashing it. Afterwards the file must hash to what
-// the uploader declared, start with the gzip magic and inflate to something that fits the
-// sketch area (ISIZE, the gzip trailer): that is what the OTA stub will write to flash.
-bool Ota::receiveBody(EthernetClient &client, size_t size, const uint8_t expectSha[32], uint32_t &imageSize,
-                      const char **why)
+// the uploader declared, carry a signature over that hash by one of the boot keys (sig, or
+// nullptr when NODE_OTA_ALLOW_UNSIGNED let it through without one), start with the gzip magic
+// and inflate to something that fits the sketch area (ISIZE, the gzip trailer): that is what
+// the OTA stub will write to flash.
+bool Ota::receiveBody(EthernetClient &client, size_t size, const uint8_t expectSha[32], const uint8_t *sig,
+                      uint32_t &imageSize, const char **why)
 {
     File f = LittleFS.open(IMAGE_FILE, "w");
     if (!f) {
@@ -263,6 +302,15 @@ bool Ota::receiveBody(EthernetClient &client, size_t size, const uint8_t expectS
         *why = "sha256 mismatch";
         return false;
     }
+    if (sig) {
+        int key = verifySignature(digest, sig);
+        if (key < 0) {
+            LittleFS.remove(IMAGE_FILE);
+            *why = "X-OTA-Sig does not verify against the boot keys";
+            return false;
+        }
+        Serial.printf("[ota] upload signed by boot key %d\n", key);
+    }
     if (head[0] != 0x1f || head[1] != 0x8b) {
         LittleFS.remove(IMAGE_FILE);
         *why = "not a gzip image";
@@ -298,6 +346,20 @@ void Ota::handleUpload(EthernetClient &client, const HttpApi::Request &req)
         HttpApi::replyError(client, 400, "X-OTA-SHA256 missing or malformed");
         return;
     }
+    char sigHex[136];
+    uint8_t sig[64];
+    bool haveSig = req.header("X-OTA-Sig", sigHex, sizeof(sigHex));
+    if (haveSig && !HttpApi::hexToBytes(sigHex, sig, sizeof(sig))) {
+        HttpApi::replyError(client, 400, "X-OTA-Sig malformed (128 hex chars, r||s)");
+        return;
+    }
+#ifndef NODE_OTA_ALLOW_UNSIGNED
+    if (!haveSig) {
+        Serial.println("[ota] upload refused: no X-OTA-Sig (unsigned uploads are not accepted)");
+        HttpApi::replyError(client, 403, "upload is not signed");
+        return;
+    }
+#endif
     if (req.contentLength == 0 || req.contentLength > sketchArea()) {
         HttpApi::replyError(client, 400, "Content-Length missing or implausible");
         return;
@@ -326,9 +388,9 @@ void Ota::handleUpload(EthernetClient &client, const HttpApi::Request &req)
     }
     Serial.printf("[ota] receiving %u bytes for %s\n", (unsigned)req.contentLength, board);
     uint32_t imageSize = 0;
-    if (!receiveBody(client, req.contentLength, expectSha, imageSize, &why)) {
+    if (!receiveBody(client, req.contentLength, expectSha, haveSig ? sig : nullptr, imageSize, &why)) {
         Serial.printf("[ota] upload failed: %s\n", why);
-        HttpApi::replyError(client, 422, why);
+        HttpApi::replyError(client, strstr(why, "X-OTA-Sig") ? 403 : 422, why);
         return;
     }
     picoOTA.begin();

@@ -19,6 +19,7 @@
 #include "NodeSettings.h"
 #include "Ntp.h"
 #include "Ota.h"
+#include "OtpProvision.h"
 
 // The RP2350 hardware watchdog. A trip survives the reset it causes and keeps counting through the
 // next setup(), so each long blocking call in setup() is fed first (a no-op on a clean boot, the
@@ -386,6 +387,11 @@ static void handleConsole()
             if (se050)
                 se050->benchEcdhNvm();
             break;
+#ifdef NODE_OTP_PROVISION
+        case 'O': // OTP provisioning: seed, page locks, boot keys, secure boot (docs/secure_boot.md)
+            otpProvisionConsole(Serial);
+            break;
+#endif
 #ifdef SE050_ALLOW_ROTATION
         case 'D': // dry run: print the PUT KEY the rotation would send, without sending
             if (se050)

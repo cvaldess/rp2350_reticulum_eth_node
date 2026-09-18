@@ -172,18 +172,24 @@ class SE050
     // chip writes; nothing here rotates anything.
     void benchScp03Kat();
 
+    // Where the static Platform SCP03 keys come from (docs/scp03_rotation.md, docs/secure_boot.md).
+    enum class KeySource : uint8_t { Factory, Bench, Otp };
+    static const char *keySourceName(KeySource s);
+    KeySource keys() const { return keySource; }
+    // Drops the cached OTP-derived keys so the next channel open re-reads the seed page
+    // (after a provisioning build has just written it).
+    static void forgetOtpKeys();
+
 #ifdef SE050_ALLOW_ROTATION
-    // Builds the PUT KEY command for the per-device keys and prints it (data field + the
-    // response the chip would echo), WITHOUT sending. Compare against tools/scp03_rotate.py
-    // plan for the same derived keys. Safe on any chip.
+    // Builds the PUT KEY command for the OTP-derived keys and prints its framing and the
+    // response the chip would echo, WITHOUT sending and without printing the keys. Safe on any chip.
     void dryRunRotation();
 
-    // Irreversible, bench only. Replaces the factory Platform SCP03 keys with per-device keys
-    // derived from SE050_ROTATION_MASTER (PUT KEY, INS 0xD8). Needs an open channel with the
-    // current keys; on success verifies the KCVs the chip echoes, adopts the new keys and
-    // reopens the channel to confirm before returning true. A malformed send is rejected by
-    // the chip (no-op); a good send is one-way. Run it on a spare SE050 first, never on a chip
-    // that matters until the whole cycle is proven. See docs/scp03_rotation.md.
+    // Irreversible, bench only. Replaces the chip's current Platform SCP03 keys (factory, or
+    // the bench master's) with the keys derived from this board's OTP seed (PUT KEY, INS 0xD8).
+    // Needs an open channel with the current keys; on success verifies the KCVs the chip
+    // echoes, adopts the new keys and reopens the channel to confirm before returning true.
+    // A malformed send is rejected by the chip (no-op); a good send is one-way. See docs/scp03_rotation.md.
     bool rotatePlatformKeys();
 #endif
 
@@ -319,15 +325,17 @@ class SE050
     uint8_t lastCardChallenge[8] = {};
     uint8_t lastCardCryptogram[8] = {};
 
-    // Which Platform SCP03 key set is in use. false = NXP factory keys (SCP_KEY_ENC/MAC/DEK);
-    // true = the per-device keys derived from the master, held in curEnc/curMac/curDek.
+    // Which Platform SCP03 key set is in use. Factory = NXP's keys (SCP_KEY_ENC/MAC/DEK);
+    // Otp / Bench = per-device keys derived from the OTP seed / the compile-time bench master
+    // (SE050_ROTATED), held in curEnc/curMac/curDek. usingRotatedKeys = keySource != Factory.
+    KeySource keySource = KeySource::Factory;
     bool usingRotatedKeys = false;
     uint8_t curEnc[16] = {};
     uint8_t curMac[16] = {};
     uint8_t curDek[16] = {};
-#ifdef SE050_ROTATED
-    void deriveRotatedKeys(uint8_t enc[16], uint8_t mac[16], uint8_t dek[16]);
-#endif
+    // Derives the per-device keys from a source; false if that source is unavailable on this
+    // board (no OTP seed / bench master not compiled).
+    bool deriveKeys(KeySource src, uint8_t enc[16], uint8_t mac[16], uint8_t dek[16]);
 #ifdef SE050_ALLOW_ROTATION
     // Assembles the PUT KEY data field (NXP createKeyData layout) into data (>=128 bytes) and
     // the expected success response (KVN + 3 KCVs) into expected[10]. Returns the data length.
