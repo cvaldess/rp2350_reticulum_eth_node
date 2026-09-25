@@ -52,14 +52,15 @@ one LAN.
 
 Two carriers with the same pin map ([include/board_pins.h](include/board_pins.h)):
 
-| PlatformIO env | Board | Flash | Role on the bench |
-|---|---|---|---|
-| `pico2_w5500_e22` | Raspberry Pi Pico 2 on a carrier with a W5500 module | 4 MB | TCP + LoRa |
-| `wiznet_5500_evb_pico2_e22p` | WIZnet W5500-EVB-Pico2 on a carrier | 2 MB | LoRa only (`NODE_DISABLE_TCP`) |
+| PlatformIO env | Board | Flash | Role on the bench | Carrier design |
+|---|---|---|---|---|
+| `pico2_w5500_e22` | Raspberry Pi Pico 2 on a carrier with a W5500 module | 4 MB | TCP + LoRa | [cvaldess/Pico2_W5500_E22](https://github.com/cvaldess/Pico2_W5500_E22) |
+| `wiznet_5500_evb_pico2_e22p` | WIZnet W5500-EVB-Pico2 on a carrier | 2 MB | LoRa only (`NODE_DISABLE_TCP`) | [cvaldess/Wiznet_5500_EVB_Pico2_E22P](https://github.com/cvaldess/Wiznet_5500_EVB_Pico2_E22P) |
 
 The SE050 sits on I²C. `SE050_ENA_PIN` lets the firmware power-cycle a hung chip, but only
 define it on a carrier with the hardware change described in `board_pins.h`; on a board that ties
-ENA to VIN, leave it out. The carrier designs are not in this repository.
+ENA to VIN, leave it out. Schematics, BOM and board images are in each carrier's repository
+(linked in the table).
 
 ## Building
 
