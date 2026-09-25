@@ -4,8 +4,9 @@
 #
 #   tmux new -d -s soak 'bash ~/pine64_soak.sh ~/soak.log 300'
 #
-# Bench 1 (Pico 2, TCP + LoRa) answers directly over TCP; bench 2 (LoRa only) is reached through
-# bench 1, so every probe to it exercises the LoRa <-> TCP transport path in both directions.
+# Since 2026-09-25 bench 2 (W5500-EVB-Pico2, TCP + LoRa) answers directly over TCP and bench 1
+# (Pico 2, LoRa only) is reached through bench 2, so every probe to it exercises the LoRa <-> TCP
+# transport path in both directions. Until then the roles were the other way round.
 LOG=${1:-$HOME/soak.log}
 INTERVAL=${2:-300}
 RNS=$HOME/rns-venv/bin

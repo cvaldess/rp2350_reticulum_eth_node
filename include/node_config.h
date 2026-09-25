@@ -30,11 +30,12 @@
 #define NODE_REMOTE_MANAGEMENT_ALLOWED {"3cf4282341f8fe4934f7b416b8287992"}
 
 // LoRa air parameters — must match on every node of the mesh (both benches run this file).
-// 869.525 MHz sits in the EU g3 sub-band (869.4–869.65, 10 % duty cycle). SF8/125 kHz/4:5 is the
-// usual Reticulum "fast" profile. Power is at the antenna: the E22 PA gain is subtracted in code.
-#define LORA_FREQUENCY_MHZ 869.525f
-#define LORA_BANDWIDTH_KHZ 125.0f
-#define LORA_SPREADING_FACTOR 8
+// 869.618 MHz with 62.5 kHz occupies 869.587–869.649, inside the EU g3 sub-band (869.4–869.65,
+// 10 % duty cycle). SF5/62.5 kHz/4:5 is ~7.8 kbps on air. Power is at the antenna: the E22 PA gain
+// is subtracted in code.
+#define LORA_FREQUENCY_MHZ 869.618f
+#define LORA_BANDWIDTH_KHZ 62.5f
+#define LORA_SPREADING_FACTOR 5
 #define LORA_CODING_RATE 5
 #define LORA_PREAMBLE_SYMBOLS 8
 #define LORA_TX_POWER_DBM 10 // bench: boards a metre apart; raise once they are further away

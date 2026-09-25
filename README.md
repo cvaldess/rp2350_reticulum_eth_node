@@ -30,8 +30,8 @@ one LAN.
 ## What it does
 
 - **LoRa ↔ TCP transport.** A `TCPClientInterface` over the W5500 to an `rnsd` running a
-  `TCPServerInterface`, and a `LoRaInterface` on RadioLib (869.525 MHz, SF8, 125 kHz, 4/5 by
-  default: the EU 869.4–869.65 MHz sub-band).
+  `TCPServerInterface`, and a `LoRaInterface` on RadioLib (869.618 MHz, SF5, 62.5 kHz, 4/5 by
+  default, inside the EU 869.4–869.65 MHz sub-band).
 - **Identity in the secure element.** The node's X25519 and Ed25519 keys (application and
   transport identities) are generated inside the SE050; announces are signed and link key
   agreements run on the chip. The I²C link to the chip is an SCP03 secure channel with
@@ -54,8 +54,8 @@ Two carriers with the same pin map ([include/board_pins.h](include/board_pins.h)
 
 | PlatformIO env | Board | Flash | Role on the bench | Carrier design |
 |---|---|---|---|---|
-| `pico2_w5500_e22` | Raspberry Pi Pico 2 on a carrier with a W5500 module | 4 MB | TCP + LoRa | [cvaldess/Pico2_W5500_E22](https://github.com/cvaldess/Pico2_W5500_E22) |
-| `wiznet_5500_evb_pico2_e22p` | WIZnet W5500-EVB-Pico2 on a carrier | 2 MB | LoRa only (`NODE_DISABLE_TCP`) | [cvaldess/Wiznet_5500_EVB_Pico2_E22P](https://github.com/cvaldess/Wiznet_5500_EVB_Pico2_E22P) |
+| `pico2_w5500_e22` | Raspberry Pi Pico 2 on a carrier with a W5500 module | 4 MB | LoRa only (`NODE_DISABLE_TCP`) | [cvaldess/Pico2_W5500_E22](https://github.com/cvaldess/Pico2_W5500_E22) |
+| `wiznet_5500_evb_pico2_e22p` | WIZnet W5500-EVB-Pico2 on a carrier | 2 MB | TCP + LoRa | [cvaldess/Wiznet_5500_EVB_Pico2_E22P](https://github.com/cvaldess/Wiznet_5500_EVB_Pico2_E22P) |
 
 The SE050 sits on I²C. `SE050_ENA_PIN` lets the firmware power-cycle a hung chip, but only
 define it on a carrier with the hardware change described in `board_pins.h`; on a board that ties

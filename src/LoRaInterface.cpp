@@ -99,7 +99,7 @@ bool LoRaInterface::start()
         return false;
     }
 
-    INFOF("%s: %.3f MHz bw %.0f kHz sf %u cr 4/%u preamble %u, %d dBm requested -> SX1262 %d dBm, ~%lu bps",
+    INFOF("%s: %.3f MHz bw %.1f kHz sf %u cr 4/%u preamble %u, %d dBm requested -> SX1262 %d dBm, ~%lu bps",
           toString().c_str(), _params.frequencyMHz, _params.bandwidthKHz, _params.spreadingFactor,
           _params.codingRate, _params.preambleSymbols, _params.txPowerDbm, sxPower, (unsigned long)_bitrate);
     _online = true;
