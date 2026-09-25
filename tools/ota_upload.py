@@ -9,7 +9,8 @@ proof the Meshtastic fork's HTTP OTA uses: a one-shot nonce from the node and
 SHA-256(nonce || PSK). The board name comes from the UF2's path (.pio/build/<env>/) unless
 --board says otherwise; the node refuses an image built for the other carrier.
 
-The PSK is read from include/node_config.h (NODE_API_PSK_HEX) unless --psk is given.
+The PSK is the one the build used: NODE_API_PSK, else api_psk.hex in NODE_KEYS_DIR
+(~/.rp2350-keys), see tools/node_secrets.py. --psk overrides both.
 
 Secure boot (docs/secure_boot.md): the image must carry the signed IMAGE_DEF the RP2350 bootrom
 checks (tools/seal.py adds it at build time), verified here exactly as the bootrom would, and the
@@ -78,14 +79,19 @@ def board_from_path(path):
 
 
 def psk_from_config():
-    here = os.path.dirname(os.path.abspath(__file__))
-    cfg = os.path.join(here, "..", "include", "node_config.h")
-    with open(cfg, encoding="utf-8") as f:
-        text = f.read()
-    m = re.search(r'#define\s+NODE_(?:API|OTA)_PSK_HEX\s+"([0-9a-fA-F]{64})"', text)
-    if not m:
-        raise SystemExit("NODE_API_PSK_HEX not found in include/node_config.h; pass --psk")
-    return m.group(1)
+    """The key tools/node_secrets.py builds into the image: NODE_API_PSK, else the key file."""
+    psk = os.environ.get("NODE_API_PSK", "").strip()
+    if not psk:
+        keys_dir = os.environ.get("NODE_KEYS_DIR") or os.path.join(os.path.expanduser("~"), ".rp2350-keys")
+        path = os.path.join(keys_dir, "api_psk.hex")
+        if not os.path.exists(path):
+            raise SystemExit("no API key: %s does not exist (a build creates it) and NODE_API_PSK is unset; "
+                             "pass --psk" % path)
+        with open(path, encoding="ascii") as f:
+            psk = f.read().strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", psk):
+        raise SystemExit("the API key is not 64 hex chars")
+    return psk
 
 
 def request(host, port, method, path, body=None, headers=None, timeout=60):
@@ -172,7 +178,7 @@ def main():
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=4244)
     ap.add_argument("--board", help="env name the node must match (default: from the UF2 path)")
-    ap.add_argument("--psk", help="64 hex chars (default: NODE_API_PSK_HEX from include/node_config.h)")
+    ap.add_argument("--psk", help="64 hex chars (default: NODE_API_PSK, else ~/.rp2350-keys/api_psk.hex)")
     ap.add_argument("--sign-key", default=default_sign_key(), help="PEM that signs the upload (default: %(default)s)")
     ap.add_argument("--allow-unsigned", action="store_true",
                     help="push an unsealed image and/or skip X-OTA-Sig (board without secure boot only)")

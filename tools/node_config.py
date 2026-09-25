@@ -9,8 +9,8 @@
     python tools/node_config.py --host 192.168.1.191 --reboot              # apply a boot-only change
 
 Values are typed by the node, not here: anything that parses as an integer is sent as one, the
-rest as a string. Writes use the same nonce + SHA-256(nonce || PSK) as the OTA, and the PSK comes
-from include/node_config.h unless --psk says otherwise.
+rest as a string. Writes use the same nonce + SHA-256(nonce || PSK) as the OTA, and the same PSK
+(NODE_API_PSK, else ~/.rp2350-keys/api_psk.hex; see tools/node_secrets.py) unless --psk says otherwise.
 """
 import argparse
 import json
@@ -47,7 +47,7 @@ def main():
     ap.add_argument("--set", action="append", metavar="KEY=VALUE", default=[])
     ap.add_argument("--reset", action="store_true", help="drop every override")
     ap.add_argument("--reboot", action="store_true", help="reboot the node (boot-only settings)")
-    ap.add_argument("--psk", help="64 hex chars (default: from include/node_config.h)")
+    ap.add_argument("--psk", help="64 hex chars (default: NODE_API_PSK, else ~/.rp2350-keys/api_psk.hex)")
     ap.add_argument("--json", action="store_true", help="print raw JSON instead of a table")
     args = ap.parse_args()
 

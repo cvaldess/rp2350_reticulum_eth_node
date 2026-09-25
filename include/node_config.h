@@ -41,10 +41,11 @@
 
 // The HTTP API on the LAN: OTA (docs/ota.md) and the runtime settings (docs/config.md) share
 // one port and one auth. Wire taken from the Meshtastic fork's HTTP OTA: a nonce, a SHA-256 over
-// nonce||PSK to prove the caller knows the key. The PSK is a bench value shared by both boards;
-// a per-device key is the OTP task. LAN only: a pre-shared key is not internet-facing auth.
+// nonce||PSK to prove the caller knows the key. LAN only: a pre-shared key is not internet-facing
+// auth. The PSK (NODE_API_PSK_HEX) is not in the repo: tools/node_secrets.py writes it into
+// node_secrets.h at build time from ~/.rp2350-keys/api_psk.hex, generating one if there is none.
+#include "node_secrets.h"
 #define NODE_API_PORT 4244
-#define NODE_API_PSK_HEX "43331e079ee9ce5ec2bf7bd10f91b0bf9aab2498d2ee71005dcc774b88bddb6c"
 #define NODE_API_NONCE_TTL_S 30
 #define NODE_API_AUTH_COOLDOWN_S 5
 // Trial boot after an OTA: the new image has to prove itself (SE050 probe passed and the

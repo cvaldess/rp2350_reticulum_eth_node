@@ -7,6 +7,8 @@
 Thumbs.db
 bench/logs/
 include/build_id.h
+# LAN API key, written by tools/node_secrets.py from ~/.rp2350-keys/api_psk.hex
+include/node_secrets.h
 # Vendor datasheets (RP2350: 7.7 MB, CC BY-ND; keep it local)
 docs/*.pdf
 # Boot signing keys never enter the repo (docs/secure_boot.md); only include/boot_pubkeys.h does

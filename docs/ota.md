@@ -30,8 +30,10 @@ Same shape as the Meshtastic fork's HTTP OTA. Minimal HTTP/1.1 on `NODE_OTA_PORT
 - `PUT /ota` with headers `X-OTA-Nonce`, `X-OTA-Auth` (= SHA-256(nonce ‖ PSK)), `X-OTA-SHA256`
   (of the gzip body), `X-OTA-Board`; body = the gzip'd image. Reply is JSON, then reboot in 500 ms.
 
-Auth is a pre-shared key, `NODE_OTA_PSK_HEX` in `include/node_config.h` — a bench value shared by
-both boards until the OTP work gives each chip its own. A wrong nonce/auth burns the nonce and
+Auth is a pre-shared key, `NODE_API_PSK_HEX`, which is never in the repo: `tools/node_secrets.py`
+builds it into the image from `~/.rp2350-keys/api_psk.hex` (or `NODE_API_PSK`), generating a random
+one on the first build, and the host tools read the same file. One key per builder, shared by the
+boards built with it; lose it and those boards only take a new image by USB. A wrong nonce/auth burns the nonce and
 starts a `NODE_OTA_AUTH_COOLDOWN_S` cooldown. **This is LAN-only**: PSK auth is not enough to expose
 the port to the internet.
 
