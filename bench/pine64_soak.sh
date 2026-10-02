@@ -17,9 +17,14 @@ export PYTHONIOENCODING=utf-8
 echo "$(date '+%F %T') --- soak start interval=${INTERVAL}s" >> "$LOG"
 while true; do
     for h in $BENCH1 $BENCH2; do
-        out=$(timeout 120 "$RNS/rnprobe" rp2350node.status "$h" -n 3 -w 2 -t 20 2>&1 | grep -E "Round-trip|Sent [0-9]+, received|timed out|No path" | tr '\n' ' ')
+        out=$(timeout -k 10 120 "$RNS/rnprobe" rp2350node.status "$h" -n 3 -w 2 -t 20 2>&1 | grep -E "Round-trip|Sent [0-9]+, received|timed out|No path" | tr '\n' ' ')
         echo "$(date '+%F %T') probe ${h:0:8} $out" >> "$LOG"
     done
-    echo "$(date '+%F %T') paths: $("$RNS/rnpath" -t 2>&1 | grep -c 'hop')" >> "$LOG"
+    # rnpath needs a timeout too: on 2026-09-26 it hung for six days with ~8 500 paths in the table and
+    # stopped the whole loop. A count from a run that was cut short is partial, so the line says so.
+    paths=$(timeout -k 10 120 "$RNS/rnpath" -t 2>&1 | grep -c 'hop'; exit "${PIPESTATUS[0]}")
+    rc=$?
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then paths="$paths (rnpath timed out)"; fi
+    echo "$(date '+%F %T') paths: $paths" >> "$LOG"
     sleep "$INTERVAL"
 done
