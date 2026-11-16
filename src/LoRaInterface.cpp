@@ -94,10 +94,16 @@ bool LoRaInterface::start()
         return false;
     }
     _radio->setRxBoostedGainMode(true);
+    _rxPatched = applyRxPatch();
     if ((state = _radio->startReceive()) != RADIOLIB_ERR_NONE) {
         ERRORF("%s: startReceive failed, code %d", toString().c_str(), state);
         return false;
     }
+    if (_rxPatched)
+        INFOF("%s: boosted RX gain, SX1262 reg 0x8B5 RX patch applied", toString().c_str());
+    else
+        WARNINGF("%s: SX1262 reg 0x8B5 RX patch not applied (write did not read back)", toString().c_str());
+    _lastAgcTickMs = millis();
 
     INFOF("%s: %.3f MHz bw %.1f kHz sf %u cr 4/%u preamble %u, %d dBm requested -> SX1262 %d dBm, ~%lu bps",
           toString().c_str(), _params.frequencyMHz, _params.bandwidthKHz, _params.spreadingFactor,
@@ -117,8 +123,10 @@ void LoRaInterface::loop()
 {
     if (!_online)
         return;
-    if (!_radio->checkIrq(RADIOLIB_IRQ_RX_DONE))
+    if (!_radio->checkIrq(RADIOLIB_IRQ_RX_DONE)) {
+        maintainFrontend(); // only here: never with a received frame still waiting in the FIFO
         return;
+    }
 
     size_t len = _radio->getPacketLength();
     uint8_t rxBuf[256];
@@ -129,6 +137,8 @@ void LoRaInterface::loop()
         _lastRssi = _radio->getRSSI();
         _lastSnr = _radio->getSNR();
         _rxFrames++;
+        _heardGood = true;
+        _lastRxGoodMs = millis();
         DEBUGF("%s: rx %u bytes rssi %.1f snr %.1f", toString().c_str(), len, _lastRssi, _lastSnr);
 
         uint8_t hdr = rxBuf[0];
@@ -168,6 +178,79 @@ void LoRaInterface::loop()
     // signature check: 100+ ms) would be silently aborted, and one that already completed would be
     // erased unread. That is how the IDENTIFY of `rnstatus -R` (sent right behind the link RTT) was
     // lost on every two-hop attempt. The only re-arm is after a transmit, in send_outgoing().
+}
+
+// Undocumented SX1262 register patch recommended by Heltec/Semtech for RX sensitivity: bit 0 of
+// 0x8B5. SPIsetRegValue reads the register back, so true means the bit is really set.
+bool LoRaInterface::applyRxPatch()
+{
+    return _module->SPIsetRegValue(0x8B5, 0x01, 0, 0) == RADIOLIB_ERR_NONE;
+}
+
+// Called from loop() with no received frame pending. Once a minute: reset the AGC if nothing good
+// has come in for a minute (gain stuck low would look like that), or if a day has gone by without
+// a reset. Unsigned millis() differences, so the 49.7-day wrap does not matter.
+void LoRaInterface::maintainFrontend()
+{
+    uint32_t now = millis();
+    if (now - _lastAgcTickMs < AGC_TICK_MS)
+        return;
+    _lastAgcTickMs = now;
+    bool hearing = _heardGood && now - _lastRxGoodMs < AGC_IDLE_MS;
+    if (hearing && _agcDone && now - _lastAgcMs < AGC_FORCED_MS)
+        return;
+    if (resetAgc()) {
+        _agcDone = true;
+        _lastAgcMs = now;
+        _agcResets++;
+    }
+}
+
+// The SX126x has no real AGC reset: warm sleep powers the analog front-end down (a standby/startReceive
+// cycle does not), then Calibrate(0x7F). Sequence and timing as Meshtastic's SX126xInterface::resetAGC().
+bool LoRaInterface::resetAgc()
+{
+    // A header already in (or a frame done) would be cut off or erased: try again next tick.
+    uint32_t irq = _radio->getIrqFlags();
+    if (irq & (RADIOLIB_SX126X_IRQ_HEADER_VALID | RADIOLIB_SX126X_IRQ_RX_DONE)) {
+        _agcSkipped++;
+        return false;
+    }
+
+    _radio->sleep(true);                              // warm: keeps the configuration
+    _radio->standby(RADIOLIB_SX126X_STANDBY_RC, true); // RC standby for a stable calibration
+    uint8_t calData = RADIOLIB_SX126X_CALIBRATE_ALL;
+    _module->SPIwriteStream(RADIOLIB_SX126X_CMD_CALIBRATE, &calData, 1, true, false);
+    _module->hal->delay(5);
+    uint32_t start = millis();
+    while (_module->hal->digitalRead(_module->getGpio())) { // BUSY
+        if (millis() - start > 50)
+            break;
+        _module->hal->yield();
+    }
+    if (_module->hal->digitalRead(_module->getGpio())) {
+        WARNINGF("%s: AGC reset: calibration not done in 50 ms", toString().c_str());
+        _agcFailed++;
+        _radio->startReceive();
+        return false;
+    }
+
+    // Calibrate(0x7F) leaves the image calibrated for 902-928 MHz.
+    _radio->calibrateImage(_params.frequencyMHz);
+    // CalibrateImage keeps running after BUSY drops; a register write in that window fails its
+    // read-back and stalls the chip.
+    _module->hal->delay(50);
+
+    // What the calibration may have reset.
+    _radio->setDio2AsRfSwitch(true);
+    _radio->setRxBoostedGainMode(true);
+    _rxPatched = applyRxPatch();
+    if (!_rxPatched) {
+        WARNINGF("%s: AGC reset: SX1262 reg 0x8B5 RX patch not re-applied", toString().c_str());
+        _agcFailed++;
+    }
+    _radio->startReceive();
+    return _rxPatched;
 }
 
 bool LoRaInterface::transmitFrame(const uint8_t *buf, size_t len)

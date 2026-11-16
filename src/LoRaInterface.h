@@ -8,6 +8,11 @@
 //   - DIO2 drives TXEN through the bridge on the module (setDio2AsRfSwitch).
 //   - TCXO 1.8 V on DIO3; DC-DC regulator; 140 mA OCP.
 //   - The module PA adds ~10 dB: requested dBm - LORA_PA_GAIN_DB is what the SX1262 is set to.
+// RX front-end, as Meshtastic's SX126xInterface does it (and our LoRa APRS iGate port):
+//   - boosted LNA gain, plus the undocumented Heltec/Semtech patch (bit 0 of register 0x8B5);
+//   - an AGC reset (warm sleep + Calibrate(0x7F)) when nothing good has been heard for a minute,
+//     or once a day regardless. The calibration clears 0x8B5 and the gain mode, so both are
+//     re-applied after it, 50 ms after CalibrateImage (a register write before that fails).
 #pragma once
 
 #include <Arduino.h>
@@ -44,6 +49,12 @@ class LoRaInterface : public RNS::InterfaceImpl
     float lastSnr() const { return _lastSnr; }
     uint32_t rxFrames() const { return _rxFrames; }
     uint32_t txFrames() const { return _txFrames; }
+    // AGC resets done, skipped because a frame was coming in, and failed (calibration timeout or
+    // 0x8B5 not re-applied); whether 0x8B5 read back set after the last write.
+    uint32_t agcResets() const { return _agcResets; }
+    uint32_t agcSkipped() const { return _agcSkipped; }
+    uint32_t agcFailed() const { return _agcFailed; }
+    bool rxPatched() const { return _rxPatched; }
 
   protected:
     virtual bool start() override;
@@ -52,8 +63,15 @@ class LoRaInterface : public RNS::InterfaceImpl
     virtual bool send_outgoing(const RNS::Bytes &data) override;
 
   private:
+    static constexpr uint32_t AGC_TICK_MS = 60UL * 1000;            // how often the front-end is looked at
+    static constexpr uint32_t AGC_IDLE_MS = 60UL * 1000;            // no good frame for this long: reset
+    static constexpr uint32_t AGC_FORCED_MS = 24UL * 60 * 60 * 1000; // a busy radio is still reset this often
+
     bool transmitFrame(const uint8_t *buf, size_t len);
     void onIncoming(const RNS::Bytes &data);
+    bool applyRxPatch();
+    void maintainFrontend();
+    bool resetAgc();
 
     Params _params;
     SPIClassRP2040 *_spi = nullptr;
@@ -67,4 +85,14 @@ class LoRaInterface : public RNS::InterfaceImpl
     float _lastSnr = 0;
     uint32_t _rxFrames = 0;
     uint32_t _txFrames = 0;
+
+    bool _rxPatched = false;
+    bool _heardGood = false;
+    bool _agcDone = false;
+    uint32_t _lastRxGoodMs = 0;
+    uint32_t _lastAgcMs = 0;
+    uint32_t _lastAgcTickMs = 0;
+    uint32_t _agcResets = 0;
+    uint32_t _agcSkipped = 0;
+    uint32_t _agcFailed = 0;
 };

@@ -453,9 +453,11 @@ static void handleConsole()
                 Serial.printf("[tcp] %s reconnects=%lu\n", tcp->connected() ? "connected" : "disconnected",
                               (unsigned long)tcp->reconnects());
             if (lora)
-                Serial.printf("[lora] %s rx=%lu tx=%lu last rssi %.1f snr %.1f\n",
+                Serial.printf("[lora] %s rx=%lu tx=%lu last rssi %.1f snr %.1f agc=%lu skip=%lu fail=%lu rxpatch=%d\n",
                               lora->online() ? "online" : "offline", (unsigned long)lora->rxFrames(),
-                              (unsigned long)lora->txFrames(), lora->lastRssi(), lora->lastSnr());
+                              (unsigned long)lora->txFrames(), lora->lastRssi(), lora->lastSnr(),
+                              (unsigned long)lora->agcResets(), (unsigned long)lora->agcSkipped(),
+                              (unsigned long)lora->agcFailed(), lora->rxPatched() ? 1 : 0);
             break;
         case 'a':
             announceNow("console", true);
