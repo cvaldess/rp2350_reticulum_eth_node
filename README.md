@@ -120,13 +120,13 @@ report that produced the table above.
   shows the stepping.
 - Secure boot protects against other code running, not against a bug in this firmware: the
   SCP03 keys are in RAM while the node runs.
-- Two changes to microReticulum are needed and have been offered upstream: private keys held
+- The node needs two changes to microReticulum, both merged upstream: private keys held
   outside the process, i.e. in a secure element
   ([attermann/microReticulum#88](https://github.com/attermann/microReticulum/pull/88)), and the
   `mtu`/`txdrp` fields that `rnstatus -R` expects in a remote status reply
-  ([#89](https://github.com/attermann/microReticulum/pull/89)). Until they are merged, the build
-  takes the library from
-  [cvaldess/microReticulum `rp2350-eth-node`](https://github.com/cvaldess/microReticulum/tree/rp2350-eth-node).
+  ([#89](https://github.com/attermann/microReticulum/pull/89)). No release carries them yet
+  (0.5.1 predates them), so `platformio.ini` pins upstream microReticulum by commit, and
+  microStore and Crypto as well.
 
 ## Licensing
 
